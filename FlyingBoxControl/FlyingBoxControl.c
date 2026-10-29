@@ -30,6 +30,7 @@
 #include <../CMSIS_RTOS/cmsis_os.h>
 #include "inc/can.h"
 #include "inc/led.h"
+#include "inc/motor.h"
 
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
@@ -107,7 +108,9 @@ int main(void)
 	/* CAN 没起来就不建接收任务，避免任务在未就绪的外设上取队列 */
 	if (CAN_Init() == 0)
 	{
-		CAN_RxTaskCreate();
+		Motor_Init();          /* 先把帧处理器挂好，再让接收任务开始取帧 */
+		CAN_RxTaskCreate();    /* 先建接收任务：初始化帧的 ACK 才有任务去消化 */
+		Motor_InitTaskCreate();/* 参数 → 轮径 → 使能 放到调度器启动后跑 */
 	}
 
 	/* Start scheduler */
