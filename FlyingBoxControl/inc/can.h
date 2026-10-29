@@ -24,12 +24,19 @@ typedef struct
 	uint8_t  data[CAN_MAX_DLC];
 } CAN_Frame;
 
-/* 帧处理回调，在 CAN 接收任务上下文运行。 */
+/* 帧处理回调，在 CAN 接收任务上下文运行。同一帧会依次交给所有已注册回调。 */
 typedef void (*CAN_FrameHandler_t)(const CAN_Frame *frame);
+
+/* 可同时注册的回调个数。每多一个上层协议就占一个槽位。 */
+#define CAN_MAX_FRAME_HANDLERS  4
 
 int      CAN_Init(void);
 void     CAN_RxTaskCreate(void);
-void     CAN_SetFrameHandler(CAN_FrameHandler_t handler);
+
+/* 注册/注销帧处理回调。重复注册同一函数不会报错，也不会重复调用。
+   注册成功返回 0，传入 NULL 或槽位已满返回 -1。 */
+int      CAN_AddFrameHandler(CAN_FrameHandler_t handler);
+void     CAN_RemoveFrameHandler(CAN_FrameHandler_t handler);
 int      CAN_Send(uint32_t stdId, const uint8_t *data, uint8_t len);
 uint32_t CAN_GetTxErrorCount(void);
 uint32_t CAN_GetTxNoAckCount(void);

@@ -40,7 +40,7 @@
 /* Private variables ---------------------------------------------------------*/
 static CAN_HandleTypeDef hcan1;
 static QueueHandle_t canRxQueue;            /* 中断 -> 接收任务传递帧        */
-static CAN_FrameHandler_t frameHandler;     /* NULL 表示尚无消费者         */
+static CAN_FrameHandler_t frameHandlers[CAN_MAX_FRAME_HANDLERS];  /* NULL = 空槽 */
 static uint32_t rxLostCount;                /* 队列满而丢弃的帧数           */
 static uint32_t txErrorCount;
 static uint32_t txNoAckCount;               /* 发出去但无人应答的帧数       */
@@ -220,13 +220,55 @@ int CAN_Send(uint32_t stdId, const uint8_t *data, uint8_t len)
 
 /**
   * @brief  注册帧处理回调。回调在 CAN 接收任务上下文运行，可以阻塞、可以做
-  *         较重的解析；未注册时收到的帧只累加诊断计数然后丢弃。
-  * @param  handler: 回调函数，NULL 表示撤销
+  *         较重的解析；同一帧会依次交给所有已注册回调，由各自按帧 ID 认领。
+  * @param  handler: 回调函数
+  * @retval 注册成功返回 0，handler 为 NULL 或槽位已满返回 -1
+  */
+int CAN_AddFrameHandler(CAN_FrameHandler_t handler)
+{
+	uint8_t i;
+
+	if (handler == NULL)
+	{
+		return -1;
+	}
+
+	for (i = 0; i < CAN_MAX_FRAME_HANDLERS; i++)
+	{
+		if (frameHandlers[i] == handler)
+		{
+			return 0;         /* 已注册，幂等 */
+		}
+	}
+
+	for (i = 0; i < CAN_MAX_FRAME_HANDLERS; i++)
+	{
+		if (frameHandlers[i] == NULL)
+		{
+			frameHandlers[i] = handler;
+			return 0;
+		}
+	}
+
+	return -1;                /* 槽位已满 */
+}
+
+/**
+  * @brief  注销帧处理回调。
+  * @param  handler: 回调函数，NULL 无效
   * @retval None
   */
-void CAN_SetFrameHandler(CAN_FrameHandler_t handler)
+void CAN_RemoveFrameHandler(CAN_FrameHandler_t handler)
 {
-	frameHandler = handler;
+	uint8_t i;
+
+	for (i = 0; i < CAN_MAX_FRAME_HANDLERS; i++)
+	{
+		if (frameHandlers[i] == handler)
+		{
+			frameHandlers[i] = NULL;
+		}
+	}
 }
 
 /**
@@ -342,6 +384,7 @@ void CAN_RxTaskCreate(void)
 static void CAN_ReceiveTask(void const *argument)
 {
 	CAN_Frame frame;
+	uint8_t i;
 
 	(void) argument;
 
@@ -352,9 +395,12 @@ static void CAN_ReceiveTask(void const *argument)
 			continue;
 		}
 
-		if (frameHandler != NULL)
+		for (i = 0; i < CAN_MAX_FRAME_HANDLERS; i++)
 		{
-			frameHandler(&frame);
+			if (frameHandlers[i] != NULL)
+			{
+				frameHandlers[i](&frame);
+			}
 		}
 	}
 }

@@ -57,6 +57,9 @@
     <ClCompile Include="src\motor.c">
       <Filter>Source files</Filter>
     </ClCompile>
+    <ClCompile Include="src\tof.c">
+      <Filter>Source files</Filter>
+    </ClCompile>
     <None Include="stm32.props">
       <Filter>Source files\Device-specific files</Filter>
     </None>
@@ -286,6 +289,9 @@
       <Filter>Header files</Filter>
     </ClInclude>
     <ClInclude Include="inc\motor.h">
+      <Filter>Header files</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\tof.h">
       <Filter>Header files</Filter>
     </ClInclude>
     <ClInclude Include="stm32f1xx_hal_conf.h">

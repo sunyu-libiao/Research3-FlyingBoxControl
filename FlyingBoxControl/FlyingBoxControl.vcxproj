@@ -61,6 +61,7 @@
     <ClCompile Include="src\can.c" />
     <ClCompile Include="src\led.c" />
     <ClCompile Include="src\motor.c" />
+    <ClCompile Include="src\tof.c" />
     <None Include="stm32.props" />
     <ClCompile Include="$(BSP_ROOT)\STM32F1xxxx\StartupFiles\startup_stm32f103xb.c" />
     <None Include="$(BSP_ROOT)\FreeRTOS\License\license.txt" />
@@ -138,6 +139,7 @@
     <ClInclude Include="inc\can.h" />
     <ClInclude Include="inc\led.h" />
     <ClInclude Include="inc\motor.h" />
+    <ClInclude Include="inc\tof.h" />
     <ClInclude Include="stm32f1xx_hal_conf.h" />
     <ClInclude Include="$(BSP_ROOT)\FreeRTOS\Source\CMSIS_RTOS\cmsis_os.h" />
     <ClInclude Include="$(BSP_ROOT)\FreeRTOS\Source\include\croutine.h" />

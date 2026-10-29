@@ -31,6 +31,7 @@
 #include "inc/can.h"
 #include "inc/led.h"
 #include "inc/motor.h"
+#include "inc/tof.h"
 
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
@@ -109,8 +110,10 @@ int main(void)
 	if (CAN_Init() == 0)
 	{
 		Motor_Init();          /* 先把帧处理器挂好，再让接收任务开始取帧 */
+		Tof_Init();            /* 两个协议共存：can 依次交给所有已注册回调 */
 		CAN_RxTaskCreate();    /* 先建接收任务：初始化帧的 ACK 才有任务去消化 */
 		Motor_InitTaskCreate();/* 参数 → 轮径 → 使能 放到调度器启动后跑 */
+		Tof_InitTaskCreate();  /* TOF 配置帧同样放到调度器启动后 */
 	}
 
 	/* Start scheduler */

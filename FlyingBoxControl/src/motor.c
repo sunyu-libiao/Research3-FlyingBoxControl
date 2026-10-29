@@ -305,7 +305,7 @@ void Motor_Init(void)
 	s_lastErrorCode = 0;
 	s_errorFrameCount = 0;
 
-	CAN_SetFrameHandler(Motor_ParseFrame);
+	CAN_AddFrameHandler(Motor_ParseFrame);
 }
 
 /**
