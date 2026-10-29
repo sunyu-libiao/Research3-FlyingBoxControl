@@ -465,13 +465,16 @@ int Tof_QueryFrequency(uint8_t index)
 /* FreeRTOS tasks -------------------------------------------------------------*/
 
 /**
-  * @brief  初始化任务：跑一遍 Tof_ConfigAll() 就删除自己。
+  * @brief  初始化任务：等上电稳定后跑一遍 Tof_ConfigAll()，然后删除自己。
   * @param  argument 未使用
   * @retval None
   */
 static void Tof_InitTask(void const *argument)
 {
 	(void) argument;
+
+	/* TOF 模块上电复位需要时间，早于它发出的 0x0316 会被静默丢弃 */
+	osDelay(TOF_INIT_SETTLE_MS);
 
 	s_initResult = Tof_ConfigAll();
 	vTaskDelete(NULL);

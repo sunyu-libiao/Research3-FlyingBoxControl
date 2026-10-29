@@ -32,6 +32,11 @@ extern "C" {
 #error "TOF_COUNT 超过状态表容量 TOF_MAX_COUNT"
 #endif
 
+/* 上电后到发出第一条配置帧之前的等待。TOF 模块上电复位与收发器稳定都需要
+   时间，过早下发 0x0316 会被静默丢弃（该帧无应答）。
+   与 MOTOR_INIT_SETTLE_MS 相互独立，两个模块各自配置。 */
+#define TOF_INIT_SETTLE_MS      3000u
+
 /* 0x0408 请求里的通道号（B1），响应 0x0409 的 B1 回显同一个值 */
 #define TOF_CH_RESET_SENSOR     8       /* 复位 VL53Lx */
 #define TOF_CH_RESET_MCU        9       /* 复位 MCU */

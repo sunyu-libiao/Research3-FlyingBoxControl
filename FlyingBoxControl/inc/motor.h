@@ -42,12 +42,26 @@ extern "C" {
 #error "设备号/马达号只有 4 bit，最大到 15"
 #endif
 
-/* 轮径，单位 0.01 mm（20 mm -> 2000）。必须填实测的滚轮或齿轮节圆直径：
-   填错不会报错，只会让所有位移/速度/加速度按同一比例缩放。 */
-#define MOTOR_WHEEL_DIAMETER_001MM   2000u
+/* 每台电机的配置（0x0316 参数、方向位、轮径、速度、加速度）都放在
+   MotorInfo 的配置区里，母版是 motor.c 的 s_defaultMotors[]（Flash，
+   下标 0 -> 设备号 MOTOR_DEV_BASE）。Motor_Init() 整份拷入状态表后，
+   初始化与收发都从这里取值，改配置只改这一处。
+   轮径必须填实测的滚轮或齿轮节圆直径，填错不会报错，
+   只会让该电机的位移/速度/加速度按同一比例缩放。 */
 
 /* 状态表中“该下标未分配电机”的地址标记，不参与收发路由 */
 #define MOTOR_ADDR_UNASSIGNED   0xFF
+
+/* 上电后到发出第一条初始化帧之前的等待。电机需要时间完成自身上电复位，
+   过早下发 0x0316 会被静默丢弃（该帧无应答，丢了也看不出来）。
+   与 TOF_INIT_SETTLE_MS 相互独立，两个模块各自配置。 */
+#define MOTOR_INIT_SETTLE_MS    3000u
+
+/* 初始化帧之间的间隔。CAN_Send() 只阻塞到帧离开邮箱（1 Mbps 下约 0.1 ms），
+   而 0x0316 要写参数、0x0408 要写轮径，电机处理跟不上连续帧；帧贴得太紧
+   会让后面的 0x0413 静默落空，表现为“只有部分电机使能成功”。
+   仅在初始化流程（任务上下文）里使用。 */
+#define MOTOR_INIT_FRAME_GAP_MS 5u
 
 /* 目标位置类型（0x0416 Data[5]） */
 #define MOTOR_POS_RELATIVE      0x00    /* 相对当前位置 */
@@ -78,8 +92,9 @@ extern "C" {
 #define MOTOR_ERR_DISCONNECT    0x0108  /* 断线 */
 
 /**
-  * @brief  0x0316 电机参数。前六个字节按协议表的 Bit 位域拼装，一个字段
-  *         对应表里的一格，取值范围见各自注释。
+  * @brief  0x0316 电机参数。按协议表的 Bit 位域拼装，一个字段对应表里的一格。
+  *         地址（设备号/马达号）与方向位不在这里：它们属于单台电机的安装
+  *         配置，统一放在 MotorInfo 里，避免同一件事记两遍。
   */
 typedef struct
 {
@@ -95,16 +110,18 @@ typedef struct
 	uint8_t damping;            /* Byte4 bit0 阻尼 */
 	uint8_t speedD;             /* Byte5 bit7..4 速度 D */
 	uint8_t torqueD;            /* Byte5 bit3..0 转矩 D */
-	uint8_t reverse;            /* Byte6 bit7 0=顺时针 1=逆时针（正对电机轴） */
 	uint8_t autoUnlock;         /* Byte6 bit6 往返模式自动解锁 */
 	uint8_t disableRemainPos;   /* Byte6 bit5 1=关闭自动返回剩余位移 */
 	uint8_t disableRemainTorque;/* Byte6 bit4 1=关闭自动返回剩余力矩 */
-	uint8_t motorIndex;         /* Byte6 bit3..0 马达号 */
-	uint8_t deviceId;           /* Byte7 设备号 */
 } MotorConfig;
 
 /**
-  * @brief  单个电机的运行状态。以下标（motorIndex）索引，Motor_GetInfo() 取用。
+  * @brief  单台电机的全部信息：配置区 + 运行状态。
+  *         以下标索引，下标 0 对应设备号 MOTOR_DEV_BASE。
+  *
+  * 配置区由 Motor_Init() 从 motor.c 里的 Flash 模板整份拷入，之后只有
+  * Motor_SetAddress() 会改地址两个字段，其余字段视为只读；
+  * 状态区只由 Motor_ParseFrame()（CAN 接收任务）写，其它任务只读。
   *
   * 协议里有两个地址字段，都被写成“设备号”，实测含义不同：
   *   devId   由 0x0313 Data[7] 写进电机，决定反馈与查询往哪回：
@@ -115,9 +132,16 @@ typedef struct
   */
 typedef struct
 {
+	/* ---- 配置区 ---- */
 	uint8_t  devId;             /* 设备号，建议 0..15，否则 0x0380+dev 会撞上别的 ID 段 */
 	uint8_t  motorId;           /* 马达号，0..15，同一条总线必须互不相同 */
+	uint8_t  reverse;           /* 0x0316 Byte6 bit7，0=顺时针 1=逆时针（正对电机轴） */
+	uint16_t wheelDiameter001mm;/* 0x0408 轮径，0.01 mm（100 mm -> 10000） */
+	uint32_t speed001mms;       /* 0x0415 速度，0.1 mm/s */
+	uint32_t accel001mms2;      /* 0x0414 加速度，0.1 mm/s^2 */
+	MotorConfig params;         /* 0x0316 其余参数字节 */
 
+	/* ---- 状态区 ---- */
 	/* 0x0420 + motorId：到目标点的剩余位移，减到 0 即到位，不是绝对位置 */
 	int32_t  remainMain;        /* 主通道，0.1 mm */
 	int32_t  remainSub;         /* 从通道，0.1 mm */
@@ -141,14 +165,15 @@ typedef struct
 	uint32_t lastRxTick;        /* 最后一帧的 HAL_GetTick()，用于判离线 */
 } MotorInfo;
 
-/* 初始化：清空状态，按下标分配地址（设备号 = 马达号 = MOTOR_DEV_BASE + 下标，
+/* 初始化：清空状态，把 motor.c 里的 Flash 默认模板整份拷入配置区
+   （模板不含地址，地址按设备号 = 马达号 = MOTOR_DEV_BASE + 下标填入；
    其余表项标为 MOTOR_ADDR_UNASSIGNED），再挂成 CAN 的帧处理器。
    必须在 CAN_Init() 之后、CAN_RxTaskCreate() 之前调用。 */
 void Motor_Init(void);
 
-/* 按 MOTOR_COUNT / MOTOR_DEV_BASE 初始化全部电机，逐台走：
-   0x0316 参数 → 0x0408 轮径（×3）→ 0x0413 上电使能。
-   会在发送期间可能阻塞，只能在调度器启动后的任务上下文调用；
+/* 按下标初始化全部电机，每台按 MotorInfo 里的配置依次发：
+  0x0316 参数 → 0x0408 轮径（×3）→ 0x0414 加速度 → 0x0415 速度 → 0x0413 使能。
+   每帧之间插 MOTOR_INIT_FRAME_GAP_MS，只能在调度器启动后的任务上下文调用；
    在 main 里请改用 Motor_InitTaskCreate()。
    返回 0 表示所有帧都已发出，-1 表示至少一帧发送失败。 */
 int Motor_InitAll(void);
@@ -204,10 +229,11 @@ int Motor_SetAccelerationSub(uint8_t motorIndex, uint32_t acceleration);
    只决定电机能否被驱动：周期反馈由 0x0316 参数开启，释放后反馈流不会停。 */
 int Motor_SetEnabled(uint8_t motorIndex, uint8_t enable);
 
-/* 0x0316 写入电机参数（初始化）。载荷里的设备号/马达号取自 config，写完后同步进状态表。
-   Byte6 的 bit5/bit4 留着 0 才会开启周期反馈（0x0420/0x0440/0x0380）；
-   马达号也在这里写入，且 0x0316 无应答，只能靠运动行为验证是否生效。 */
-int Motor_ConfigParams(uint8_t motorIndex, const MotorConfig *config);
+/* 0x0316 写入电机参数（初始化）。载荷全部取自该下标 MotorInfo 的配置区：
+   Byte6 bit7 = reverse、bit3..0 = motorId，Byte7 = devId，其余取自 params。
+   Byte6 的 bit5/bit4 留着 0 才会开启周期反馈（0x0420/0x0440/0x0380）。
+   0x0316 无应答，配置是否真的生效只能靠运动行为验证。 */
+int Motor_ConfigParams(uint8_t motorIndex);
 
 /* 0x0403 Data[1]=0x40 配置机械臂成员，motorIds 为参与控制的设备号，1~6 个 */
 int Motor_SetArmMembers(uint8_t motorIndex, const uint8_t *motorIds, uint8_t count);

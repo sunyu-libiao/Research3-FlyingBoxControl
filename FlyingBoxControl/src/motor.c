@@ -77,28 +77,70 @@ static uint16_t s_lastErrorCode;
 static uint32_t s_errorFrameCount;
 static int s_initResult = MOTOR_INIT_PENDING;
 
-/* 0x0316 参数预设：协议表的参考值 B4 BF CF AA 00 5F 拆成各字段。
-   设备号与马达号由 Motor_InitAll() 逐台填写，不在这里固定。 */
-static const MotorConfig s_defaultParams =
+/* 每台电机一份默认配置模板（Flash）。下标与状态表一致：0 -> 设备号 MOTOR_DEV_BASE。
+   只填配置区，状态区隐式为 0；Motor_Init() 整份拷入 s_motors 后成为可读的
+   单一数据源，收发与配置都从这里取值，不再有第二份副本需要同步。
+   地址（devId/motorId）不在这里写死：仍由 MOTOR_DEV_BASE 推导，
+   避免同一个基准在两处维护。 */
+#define MOTOR_PARAMS_DEFAULT \
+	.reserved0 = 0x0B,               \
+	.polePairs = 4,                  \
+	.speedP = 0x0B,                  \
+	.speedI = 0x0F,                  \
+	.torqueP = 0x0C,                 \
+	.torqueI = 0x0F,                 \
+	.currentCw = 0x0A,               \
+	.currentCcw = 0x0A,              \
+	.brake = 0,                      \
+	.damping = 0,                    \
+	.speedD = 0x05,                  \
+	.torqueD = 0x0F,                 \
+	.autoUnlock = 0,                 \
+	.disableRemainPos = 0,           \
+	.disableRemainTorque = 0
+
+static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 {
-	.reserved0 = 0x0B,
-	.polePairs = 4,
-	.speedP = 0x0B,
-	.speedI = 0x0F,
-	.torqueP = 0x0C,
-	.torqueI = 0x0F,
-	.currentCw = 0x0A,
-	.currentCcw = 0x0A,
-	.brake = 0,
-	.damping = 0,
-	.speedD = 0x05,
-	.torqueD = 0x0F,
-	.reverse = 0,
-	.autoUnlock = 0,
-	.disableRemainPos = 0,
-	.disableRemainTorque = 0,
-	.motorIndex = 0,
-	.deviceId = 0
+	/* 下标 0 / 设备号 7 */
+	{
+		.reverse = 0,
+		.wheelDiameter001mm = 10000u,
+		.speed001mms = 2000u,
+		.accel001mms2 = 4000u,
+		.params = { MOTOR_PARAMS_DEFAULT }
+	},
+	/* 下标 1 / 设备号 8，安装方向相反 */
+	{
+		.reverse = 1,
+		.wheelDiameter001mm = 10000u,
+		.speed001mms = 2000u,
+		.accel001mms2 = 4000u,
+		.params = { MOTOR_PARAMS_DEFAULT }
+	},
+	/* 下标 2 / 设备号 9，安装方向相反 */
+	{
+		.reverse = 1,
+		.wheelDiameter001mm = 10000u,
+		.speed001mms = 2000u,
+		.accel001mms2 = 4000u,
+		.params = { MOTOR_PARAMS_DEFAULT }
+	},
+	/* 下标 3 / 设备号 10 */
+	{
+		.reverse = 0,
+		.wheelDiameter001mm = 10000u,
+		.speed001mms = 2000u,
+		.accel001mms2 = 4000u,
+		.params = { MOTOR_PARAMS_DEFAULT }
+	},
+	/* 下标 4 / 设备号 11，安装方向相反 */
+	{
+		.reverse = 1,
+		.wheelDiameter001mm = 10000u,
+		.speed001mms = 2000u,
+		.accel001mms2 = 4000u,
+		.params = { MOTOR_PARAMS_DEFAULT }
+	}
 };
 
 /* Private function prototypes -----------------------------------------------*/
@@ -276,8 +318,7 @@ static void parseQueryResponse(const CAN_Frame *frame)
 /* Public functions ----------------------------------------------------------*/
 
 /**
-  * @brief  清空全部电机状态、按 MOTOR_DEV_BASE 给已配置电机分配地址
-  *         （设备号 = 马达号 = 基准 + 下标，其余表项标记为未分配），
+  * @brief  清空全部电机状态，把 Flash 默认模板整份拷入配置区，按下标分配地址，
   *         并把本文件的解析函数注册成 CAN 的帧处理器。
   * @param  None
   * @retval None
@@ -289,14 +330,15 @@ void Motor_Init(void)
 	memset(s_motors, 0, sizeof(s_motors));
 	for (i = 0; i < MOTOR_MAX_COUNT; i++)
 	{
-		/* 0xFF = 未分配：若沿用下标，设备号 7 会同时属于下标 0 和 7 */
 		if (i < MOTOR_COUNT)
 		{
+			s_motors[i] = s_defaultMotors[i];          /* 配置区 + 清零的状态区 */
 			s_motors[i].devId = (uint8_t)(MOTOR_DEV_BASE + i);
 			s_motors[i].motorId = (uint8_t)(MOTOR_DEV_BASE + i);
 		}
 		else
 		{
+			/* 0xFF = 未分配：若沿用下标，设备号 7 会同时属于下标 0 和 7 */
 			s_motors[i].devId = MOTOR_ADDR_UNASSIGNED;
 			s_motors[i].motorId = MOTOR_ADDR_UNASSIGNED;
 		}
@@ -309,37 +351,51 @@ void Motor_Init(void)
 }
 
 /**
-  * @brief  按 MOTOR_COUNT / MOTOR_DEV_BASE 逐台初始化：写参数 → 配轮径 → 使能。
-  *         地址取 Motor_Init() 登记的值（可用 Motor_SetAddress 覆盖），
+  * @brief  按下标初始化全部电机，载荷全部取自对应 MotorInfo 的配置区：
+  *         参数 → 轮径 → 加速度 → 速度 → 使能。
   *         SN 已在电机侧固化，不再绑定。
-  *         整个过程不插入延时：发送是全阻塞的，每条帧离开邮箱后才返回。
+  *         每帧之间插 MOTOR_INIT_FRAME_GAP_MS：电机处理参数/轮径写入需要时间，
+  *         连续帧贴在一起时后面的帧会被忽略，表现为部分电机使能不了。
+  *         本函数会 osDelay，只能在任务上下文调用。
   * @param  None
   * @retval 0 所有帧已发出，-1 至少一帧发送失败
   */
 int Motor_InitAll(void)
 {
-	MotorConfig params;
 	uint8_t i;
 	int result = 0;
 
 	for (i = 0; i < MOTOR_COUNT; i++)
 	{
-		params = s_defaultParams;
-		params.deviceId = s_motors[i].devId;
-		params.motorIndex = (uint8_t)(s_motors[i].motorId & 0x0Fu);
+		if (Motor_ConfigParams(i) != 0)
+		{
+			result = -1;
+		}
+		osDelay(MOTOR_INIT_FRAME_GAP_MS);
 
-		if (Motor_ConfigParams(i, &params) != 0)
+		if (Motor_ConfigWheelDiameter(i, s_motors[i].wheelDiameter001mm) != 0)
 		{
 			result = -1;
 		}
-		if (Motor_ConfigWheelDiameter(i, MOTOR_WHEEL_DIAMETER_001MM) != 0)
+		osDelay(MOTOR_INIT_FRAME_GAP_MS);
+
+		if (Motor_SetAccelerationMain(i, s_motors[i].accel001mms2) != 0)
 		{
 			result = -1;
 		}
+		osDelay(MOTOR_INIT_FRAME_GAP_MS);
+
+		if (Motor_SetSpeedMain(i, s_motors[i].speed001mms) != 0)
+		{
+			result = -1;
+		}
+		osDelay(MOTOR_INIT_FRAME_GAP_MS);
+
 		if (Motor_SetEnabled(i, 1) != 0)
 		{
 			result = -1;
 		}
+		osDelay(MOTOR_INIT_FRAME_GAP_MS);
 	}
 
 	return result;
@@ -370,7 +426,7 @@ int Motor_GetInitResult(void)
 /* FreeRTOS tasks -------------------------------------------------------------*/
 
 /**
-  * @brief  初始化任务：跑一遍 Motor_InitAll() 就删除自己。
+  * @brief  初始化任务：等上电稳定后跑一遍 Motor_InitAll()，然后删除自己。
   *         失败结果留在 s_initResult 里，由 Motor_GetInitResult() 读取。
   * @param  argument 未使用
   * @retval None
@@ -378,6 +434,9 @@ int Motor_GetInitResult(void)
 static void Motor_InitTask(void const *argument)
 {
 	(void) argument;
+
+	/* 电机上电复位需要时间，早于它发出的 0x0316 会被静默丢弃 */
+	osDelay(MOTOR_INIT_SETTLE_MS);
 
 	s_initResult = Motor_InitAll();
 	vTaskDelete(NULL);
@@ -677,43 +736,38 @@ int Motor_SetEnabled(uint8_t motorIndex, uint8_t enable)
 }
 
 /**
-  * @brief  0x0316 写入电机参数（初始化）。Byte6 的 bit5/bit4 = 0 才开启周期反馈，
-  *         bit3..0 是马达号；Byte7 是设备号。无应答，只能靠运动行为验证。
+  * @brief  0x0316 写入电机参数（初始化）。载荷全部取自该下标的配置区：
+  *         Byte6 bit7 = reverse、bit3..0 = motorId，Byte7 = devId，其余取自 params。
+  *         无应答，写入是否生效只能靠运动行为验证，所以这里不回写状态表。
   * @param  motorIndex: 下标
-  * @param  config: 参数字节；报文里的设备号/马达号取自 config
   * @retval 0 已发出，-1 失败
   */
-int Motor_ConfigParams(uint8_t motorIndex, const MotorConfig *config)
+int Motor_ConfigParams(uint8_t motorIndex)
 {
+	const MotorInfo *m;
 	uint8_t data[8];
 
-	if ((motorIndex >= MOTOR_MAX_COUNT) || (config == NULL))
+	if (motorIndex >= MOTOR_MAX_COUNT)
 	{
 		return -1;
 	}
 
-	data[0] = (uint8_t)(((config->reserved0 & 0x0Fu) << 4) | (config->polePairs & 0x0Fu));
-	data[1] = (uint8_t)(((config->speedP & 0x0Fu) << 4) | (config->speedI & 0x0Fu));
-	data[2] = (uint8_t)(((config->torqueP & 0x0Fu) << 4) | (config->torqueI & 0x0Fu));
-	data[3] = (uint8_t)(((config->currentCw & 0x0Fu) << 4) | (config->currentCcw & 0x0Fu));
-	data[4] = (uint8_t)(((config->brake & 0x01u) << 1) | (config->damping & 0x01u));
-	data[5] = (uint8_t)(((config->speedD & 0x0Fu) << 4) | (config->torqueD & 0x0Fu));
-	data[6] = (uint8_t)(((config->reverse & 0x01u) << 7) |
-	                    ((config->autoUnlock & 0x01u) << 6) |
-	                    ((config->disableRemainPos & 0x01u) << 5) |
-	                    ((config->disableRemainTorque & 0x01u) << 4) |
-	                    (config->motorIndex & 0x0Fu));
-	data[7] = config->deviceId;
+	m = &s_motors[motorIndex];
 
-	if (CAN_Send(MOTOR_ID_CONFIG_PARAM, data, 8) != 0)
-	{
-		return -1;
-	}
+	data[0] = (uint8_t)(((m->params.reserved0 & 0x0Fu) << 4) | (m->params.polePairs & 0x0Fu));
+	data[1] = (uint8_t)(((m->params.speedP & 0x0Fu) << 4) | (m->params.speedI & 0x0Fu));
+	data[2] = (uint8_t)(((m->params.torqueP & 0x0Fu) << 4) | (m->params.torqueI & 0x0Fu));
+	data[3] = (uint8_t)(((m->params.currentCw & 0x0Fu) << 4) | (m->params.currentCcw & 0x0Fu));
+	data[4] = (uint8_t)(((m->params.brake & 0x01u) << 1) | (m->params.damping & 0x01u));
+	data[5] = (uint8_t)(((m->params.speedD & 0x0Fu) << 4) | (m->params.torqueD & 0x0Fu));
+	data[6] = (uint8_t)(((m->reverse & 0x01u) << 7) |
+	                    ((m->params.autoUnlock & 0x01u) << 6) |
+	                    ((m->params.disableRemainPos & 0x01u) << 5) |
+	                    ((m->params.disableRemainTorque & 0x01u) << 4) |
+	                    (m->motorId & 0x0Fu));
+	data[7] = m->devId;
 
-	/* 电机从此按这两个地址应答，状态表跟着改，否则后续收发会找错电机 */
-	s_motors[motorIndex].devId = config->deviceId;
-	s_motors[motorIndex].motorId = config->motorIndex & 0x0Fu;
-	return 0;
+	return CAN_Send(MOTOR_ID_CONFIG_PARAM, data, 8);
 }
 
 /**
@@ -799,6 +853,7 @@ int Motor_MoveArm(int16_t delta1, int16_t delta2, int16_t delta3, int16_t delta4
 
 /**
   * @brief  0x0408 配置轮径。实测不配轮径运动指令不会执行，协议要求重复写三次。
+  *         三次之间插 MOTOR_INIT_FRAME_GAP_MS，本函数会 osDelay。
   * @param  motorIndex: 下标
   * @param  diameter: 轮径，0.01 mm
   * @retval 三次都发出返回 0，任一次失败返回 -1
@@ -825,6 +880,7 @@ int Motor_ConfigWheelDiameter(uint8_t motorIndex, uint16_t diameter)
 		{
 			result = -1;
 		}
+		osDelay(MOTOR_INIT_FRAME_GAP_MS);
 	}
 
 	return result;
