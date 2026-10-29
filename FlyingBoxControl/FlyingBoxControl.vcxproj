@@ -58,6 +58,8 @@
   <ItemGroup>
     <ClCompile Include="FlyingBoxControl.c" />
     <ClCompile Include="system_stm32f1xx.c" />
+    <ClCompile Include="src\can.c" />
+    <ClCompile Include="src\led.c" />
     <None Include="stm32.props" />
     <ClCompile Include="$(BSP_ROOT)\STM32F1xxxx\StartupFiles\startup_stm32f103xb.c" />
     <None Include="$(BSP_ROOT)\FreeRTOS\License\license.txt" />
@@ -132,6 +134,8 @@
     <ClCompile Include="$(BSP_ROOT)\STM32F1xxxx\STM32F1xx_HAL_Driver\Src\stm32f1xx_ll_usart.c" />
     <ClCompile Include="$(BSP_ROOT)\STM32F1xxxx\STM32F1xx_HAL_Driver\Src\stm32f1xx_ll_utils.c" />
     <ClInclude Include="FreeRTOSConfig.h" />
+    <ClInclude Include="inc\can.h" />
+    <ClInclude Include="inc\led.h" />
     <ClInclude Include="stm32f1xx_hal_conf.h" />
     <ClInclude Include="$(BSP_ROOT)\FreeRTOS\Source\CMSIS_RTOS\cmsis_os.h" />
     <ClInclude Include="$(BSP_ROOT)\FreeRTOS\Source\include\croutine.h" />

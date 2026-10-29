@@ -48,6 +48,12 @@
     <ClCompile Include="system_stm32f1xx.c">
       <Filter>Source files</Filter>
     </ClCompile>
+    <ClCompile Include="src\can.c">
+      <Filter>Source files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\led.c">
+      <Filter>Source files</Filter>
+    </ClCompile>
     <None Include="stm32.props">
       <Filter>Source files\Device-specific files</Filter>
     </None>
@@ -268,6 +274,12 @@
       <Filter>Source files\Device-specific files\LL</Filter>
     </ClCompile>
     <ClInclude Include="FreeRTOSConfig.h">
+      <Filter>Header files</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\can.h">
+      <Filter>Header files</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\led.h">
       <Filter>Header files</Filter>
     </ClInclude>
     <ClInclude Include="stm32f1xx_hal_conf.h">

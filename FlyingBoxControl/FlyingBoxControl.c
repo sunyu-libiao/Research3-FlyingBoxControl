@@ -28,13 +28,55 @@
 /* Includes ------------------------------------------------------------------*/
 #include <stm32f1xx_hal.h>
 #include <../CMSIS_RTOS/cmsis_os.h>
+#include "inc/can.h"
+#include "inc/led.h"
 
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
 /* Private macro -------------------------------------------------------------*/
 /* Private variables ---------------------------------------------------------*/
 /* Private function prototypes -----------------------------------------------*/
+static int SystemClock_Config(void);
 /* Private functions ---------------------------------------------------------*/
+
+/**
+  * @brief  系统时钟：HSE 8 MHz 经 PLL x9 得 SYSCLK 72 MHz。
+  *         HCLK = 72 MHz，PCLK1 = 36 MHz，PCLK2 = 72 MHz。
+  *         APB1 上限就是 36 MHz；CAN 位定时按 PCLK1 = 36 MHz 推算，改这里
+  *         必须同步改 can.c 的 Prescaler/TimeSeg。
+  * @param  None
+  * @retval 成功返回 0，HSE 起振或 PLL 锁定失败返回 -1
+  */
+static int SystemClock_Config(void)
+{
+	RCC_OscInitTypeDef oscInit = { 0 };
+	RCC_ClkInitTypeDef clkInit = { 0 };
+
+	oscInit.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+	oscInit.HSEState = RCC_HSE_ON;
+	oscInit.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+	oscInit.PLL.PLLState = RCC_PLL_ON;
+	oscInit.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+	oscInit.PLL.PLLMUL = RCC_PLL_MUL9;          /* 8 MHz x 9 = 72 MHz */
+	if (HAL_RCC_OscConfig(&oscInit) != HAL_OK)
+	{
+		return -1;
+	}
+
+	clkInit.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+	                    RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+	clkInit.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+	clkInit.AHBCLKDivider = RCC_SYSCLK_DIV1;
+	clkInit.APB1CLKDivider = RCC_HCLK_DIV2;
+	clkInit.APB2CLKDivider = RCC_HCLK_DIV1;
+	/* 48 MHz < SYSCLK <= 72 MHz 需要 2 个 Flash 等待周期 */
+	if (HAL_RCC_ClockConfig(&clkInit, FLASH_LATENCY_2) != HAL_OK)
+	{
+		return -1;
+	}
+
+	return 0;
+}
 
 /**
   * @brief  Main program
@@ -51,6 +93,23 @@ int main(void)
      */
 	HAL_Init();  
 	
+	/* 时钟起不来就不能继续：CAN 位定时基于 PCLK1 = 36 MHz，掉到 HSI 上
+	   总线速率会错，而外设也不该带着错的时序启动 */
+	if (SystemClock_Config() != 0)
+	{
+		for (;;)
+			;
+	}
+
+	LED_Init();
+	LED_TaskCreate();
+
+	/* CAN 没起来就不建接收任务，避免任务在未就绪的外设上取队列 */
+	if (CAN_Init() == 0)
+	{
+		CAN_RxTaskCreate();
+	}
+
 	/* Start scheduler */
 	osKernelStart();
 
