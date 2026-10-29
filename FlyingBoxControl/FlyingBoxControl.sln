@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.37824.6 d17.14
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FlyingBoxControl", "FlyingBoxControl.vcxproj", "{B82591EE-6DD5-E66C-7AC3-2B15E4C11009}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|VisualGDB = Debug|VisualGDB
+		Release|VisualGDB = Release|VisualGDB
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B82591EE-6DD5-E66C-7AC3-2B15E4C11009}.Debug|VisualGDB.ActiveCfg = Debug|VisualGDB
+		{B82591EE-6DD5-E66C-7AC3-2B15E4C11009}.Debug|VisualGDB.Build.0 = Debug|VisualGDB
+		{B82591EE-6DD5-E66C-7AC3-2B15E4C11009}.Release|VisualGDB.ActiveCfg = Release|VisualGDB
+		{B82591EE-6DD5-E66C-7AC3-2B15E4C11009}.Release|VisualGDB.Build.0 = Release|VisualGDB
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {3E778219-789C-4367-95C5-3D92A3FBF5AC}
+	EndGlobalSection
+EndGlobal
