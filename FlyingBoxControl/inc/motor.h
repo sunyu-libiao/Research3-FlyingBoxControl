@@ -111,7 +111,7 @@ extern "C" {
    这个宏只作为 MotorInfo.homeSpeed001mms 的默认值；轮径单独标定过的
    电机必须在自己的配置里给对应量级的值。
    归位结束后由 Motor_InitAll() 恢复 speed001mms。 */
-#define MOTOR_HOME_SPEED_001MMS 80000u
+#define MOTOR_HOME_SPEED_001MMS 160000u
 
 /* 归位加速度的默认值，0.1 mm/s^2，同样随轮径缩放。
    实测依据（当时轮径 20 mm）：运行加速度档位会在加速段就触发过流保护释放，
@@ -119,7 +119,7 @@ extern "C" {
    所以轮径或速度一变就必须重新换算，不能沿用旧数字。
    ★ 一出现启动就掉电，先把这一台的 homeAccel001mms2 减半，再降 homeSpeed001mms。
    与上面的速度一样，它只是默认值，逐台值在 MotorInfo 里。 */
-#define MOTOR_HOME_ACCEL_001MMS2 40000u
+#define MOTOR_HOME_ACCEL_001MMS2 80000u
 
 /* 归位等待时长不是一个宏，而是由 homeTravel001mm / 该台的归位速度 / 该台的
    归位加速度在运行时算出来（motor.c 的 homeWaitMsFor）：

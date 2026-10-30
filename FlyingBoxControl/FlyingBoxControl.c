@@ -279,8 +279,9 @@ static int MoveUntilTof(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
   *         等电机复位 → 9 号单独初始化并归位 → 11 号单独初始化并归位 →
   *         全部重新初始化 → 全部使能 → 把此刻定义为绝对 0 →
   *         10 号绝对定位（把装置转到正前方）→
-  *         9 号持续前进，直到 TOF 距离满足条件时停车。
-  *         整个流程是阻塞的（逐台等归位延时），期间本任务一直占着。
+  *         9 号持续前进，直到 TOF 距离满足条件时停车 →
+  *         11 号绝对定位到 11000。
+  *         整个流程是阻塞的（逐台等归位延时与到位），期间本任务一直占着。
   *         不重试：失败只计数，由上层检查机械与参数。
   * @param  argument 未使用
   * @retval None
@@ -296,7 +297,7 @@ static void MotorControl_Task(void const *argument)
 	   Motor_BringUp() 末尾的 Motor_InitAll() 下发且已使能，这里只发目标位置。
 	   它不参与归位，绝对 0 是启动末尾置零那一刻的位置。
 	   必须先转到位再前进，否则测距方向不对。 */
-	(void)Motor_SetTargetPositionMain(3, 80000, MOTOR_POS_ABSOLUTE);
+	(void)Motor_SetTargetPositionMain(3, 75000, MOTOR_POS_ABSOLUTE);
 	(void)Motor_WaitArrive(3, 5000);
 
 	/* 测试：9 号（下标 2）持续前进，直到 25 号 TOF（下标 0）测得的距离缩到阈值。
@@ -304,7 +305,21 @@ static void MotorControl_Task(void const *argument)
 	   travel 与 speed 是轮缘弧长量，必须与 9 号的轮径同量级；阈值来自 TOF，
 	   是真实的毫米量，不随轮径变化（协议单位 0.1 mm，mm × 10）。
 	   返回值留在 s_lastMoveResult 里，含义见该变量的声明处。 */
-	s_lastMoveResult = (int8_t)MoveUntilTof(2, 0, 10367, 900, 1, 259, 30000);
+	s_lastMoveResult = (int8_t)MoveUntilTof(2, 0, 10000, 1000, 1, 500, 30000);
+
+	/* 9 号停定之后，11 号（下标 4）绝对定位到 11000。
+	   绝对 0 是 Motor_BringUp() 末尾置零那一刻的位置，与 9 号的停车位置无关，
+	   所以这里给的是坐标值而不是相对量。11 号驱动的是钩爪类机构，行程没有
+	   可标定的直线关系，11000 按它自己的配置单位走，不代表真实毫米。
+
+	   ★ 只有 9 号确实到位并停住（0）才动 11 号。超时（-1）、始终无读数（-2）、
+	     停车帧全丢（-5）时 9 号可能还在动，此时再让 11 号动作会让两台机构
+	     同时运动，出问题无法归因。 */
+	if (s_lastMoveResult == 0)
+	{
+		(void)Motor_SetTargetPositionMain(4, 110000, MOTOR_POS_ABSOLUTE);
+		(void)Motor_WaitArrive(4, 5000);
+	}
 
 	for (;;)
 	{

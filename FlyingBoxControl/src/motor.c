@@ -103,8 +103,8 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 	{
 		.reverse = 0,
 		.wheelDiameter001mm = 60000u,
-		.speed001mms = 80000u,
-		.accel001mms2 = 40000u,
+		.speed001mms = 160000u,
+		.accel001mms2 = 80000u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = 0,
 		.homeSpeed001mms = MOTOR_HOME_SPEED_001MMS,
@@ -114,8 +114,8 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 	{
 		.reverse = 1,
 		.wheelDiameter001mm = 60000u,
-		.speed001mms = 80000u,
-		.accel001mms2 = 40000u,
+		.speed001mms = 160000u,
+		.accel001mms2 = 80000u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = 0,
 		.homeSpeed001mms = MOTOR_HOME_SPEED_001MMS,
@@ -131,19 +131,19 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 	{
 		.reverse = 1,
 		.wheelDiameter001mm = 622u,
-		.speed001mms = 829u,
-		.accel001mms2 = 415u,
+		.speed001mms = 1600u,
+		.accel001mms2 = 800u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = -7257,
-		.homeSpeed001mms = 829u,
-		.homeAccel001mms2 = 415u
+		.homeSpeed001mms = 1600u,
+		.homeAccel001mms2 = 800u
 	},
 	/* 下标 3 / 设备号 10，暂不处理 */
 	{
 		.reverse = 0,
 		.wheelDiameter001mm = 60000u,
-		.speed001mms = 80000u,
-		.accel001mms2 = 40000u,
+		.speed001mms = 160000u,
+		.accel001mms2 = 80000u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = -700000,
 		.homeSpeed001mms = MOTOR_HOME_SPEED_001MMS,
@@ -153,8 +153,8 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 	{
 		.reverse = 1,
 		.wheelDiameter001mm = 60000u,
-		.speed001mms = 80000u,
-		.accel001mms2 = 40000u,
+		.speed001mms = 160000u,
+		.accel001mms2 = 80000u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = -400000,
 		.homeSpeed001mms = MOTOR_HOME_SPEED_001MMS,
