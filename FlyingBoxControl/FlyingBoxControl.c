@@ -71,6 +71,20 @@
 /* 回原点动作没执行（前一步没成功）时的记录值 */
 #define MOTOR_RETURN_SKIPPED       (-9)
 
+/* 一次能同时驱动的电机数上限（组式接近用）。只给"两根皮带一起走"用，
+   留 2 就够；需要更多就同步改这里。 */
+#define MOTOR_MOVE_GROUP_MAX       2u
+
+/* 皮带组向 26 号 TOF 接近：行程预算、速度与时限。
+   行程只要"够长"，真正的停车靠 TOF 判据，多余的行程不会走完；
+   但不能超过皮带机械行程，否则会顶到末端触发保护释放。
+   ★ 速度不能跟着运行参数一起翻倍。停车是减速过程，刹距约 v^2/(2a)，
+     当前配置下已经占掉阈值的一半：再翻倍会让刹距超过 5 cm 阈值，
+     必然冲过目标点。要提速得先加大加速度或放宽阈值。 */
+#define BELT_APPROACH_TRAVEL       (-10000)     /* 负值 = 物理向后，与 homeTravel001mm 的符号惯例一致 */
+#define BELT_APPROACH_SPEED        800u
+#define BELT_APPROACH_TIMEOUT_MS   30000u
+
 /* Private macro -------------------------------------------------------------*/
 /* Private variables ---------------------------------------------------------*/
 /* 电机任务的最后一次运动结果，调试时在调试器里直接看这个变量：
@@ -82,6 +96,10 @@ static volatile int8_t s_lastMoveResult;
    0 = 三台都已到位，其它负值见 ReturnAxisToOrigin() 的返回码。 */
 static volatile int8_t s_lastReturnResult = MOTOR_RETURN_SKIPPED;
 
+/* 皮带组接近 TOF 的结果。MOTOR_RETURN_SKIPPED = 前面某步失败没执行，
+   其余见 MoveGroupUntilTof() 的返回码。 */
+static volatile int8_t s_lastBeltResult = MOTOR_RETURN_SKIPPED;
+
 /* Private function prototypes -----------------------------------------------*/
 static int SystemClock_Config(void);
 static int stopMotor(uint8_t motorIndex);
@@ -89,6 +107,9 @@ static int readPosition(uint8_t motorIndex, int32_t *position, uint32_t timeoutM
 static uint8_t isNearTarget(int32_t remain);
 static int ReturnAxisToOrigin(uint8_t motorIndex, uint8_t beltIndexA, uint8_t beltIndexB,
                               uint32_t timeoutMs);
+static int MoveGroupUntilTof(uint8_t count, const uint8_t *motorIndices, uint8_t tofIndex,
+                             int32_t travel, uint16_t stopDistance, uint8_t decreasing,
+                             uint32_t speed, uint32_t timeoutMs);
 static int MoveUntilTof(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
                         uint16_t stopDistance, uint8_t decreasing,
                         uint32_t speed, uint32_t timeoutMs);
@@ -183,52 +204,62 @@ static int stopMotor(uint8_t motorIndex)
 }
 
 /**
-  * @brief  让一台电机持续运动，直到 TOF 测得的距离到达阈值时停住。
+  * @brief  让一组电机同时持续运动，直到 TOF 测得的距离到达阈值时全部停住。
   *
   *         协议里没有“停止”指令，也没有速度模式，所以做法是：先发一段
-  *         足够长的相对位移让它自己跑，条件满足后再让它的目标回到当前位置
-  *         （相对 0 位移），做法见 stopMotor() 的说明。
+  *         足够长的相对位移让它们自己跑，条件满足后再让目标回到当前位置，
+  *         做法见 stopMotor() 的说明。
   *
-  *         判据只有一条：读数 valid 且距离已经达到阈值。到了就发停车指令。
+  *         ★ 同时启动靠帧序：先把所有台的速度都发完，再连着发位移，
+  *           让位移帧之间只隔 CAN 发送时间。若写成“设一台速度就发一台位移”，
+  *           后一台会比前一台晚十几毫秒，同步就散了。
+  *
+  *         判据只有一条：读数 valid 且距离已经达到阈值。到了就全部停车。
   *         valid 必须查——无效读数下 distance 被置 0，会被当成“已经贴到目标”，
   *         一启动就停。
   *
-  *         不要求“必须是新的一帧”：距离已经到了就该停，同一帧重复读到并不
-  *         改变这个事实；而漏停的代价是撞机。
+  *         不要求“必须是新的一帧”，也不限制读数新鲜度：距离已经到了就该停，
+  *         `0x0793` 的上报周期由模块自己掌控且会变，拿固定窗口去卡它会让判据
+  *         永远不过。循环由 timeoutMs 兜底。
   *
-  *         不再限制读数新鲜度：上报周期由模块自己掌控且会变，拿一个固定窗口
-  *         去卡它，窗口比实际周期短时判据永远不过，表现就是距离早就够了却
-  *         一直不停。循环由 timeoutMs 兜底，不会永久卡死。
-  *
-  *         停车由 stopMotor() 负责；它的帧没能发出时返回 -5。本函数不确认
-  *         电机是否真的停住——帧发出去了不等于电机执行了。
-  *         返回后这台电机内部的速度是 speed，结构体里的 speed001mms 并未改变，
+  *         停车由 stopMotor() 逐台负责；任意一台的停车帧发不出去都返回 -5。
+  *         返回后这些电机内部的速度是 speed，结构体里的 speed001mms 并未改变，
   *         要恢复运行参数得重新 Motor_InitAll()。
-  * @param  motorIndex: 电机下标
+  * @param  count: 电机台数，1~MOTOR_MOVE_GROUP_MAX
+  * @param  motorIndices: 电机下标数组
   * @param  tofIndex: TOF 下标
-  * @param  travel: 相对位移，0.1 mm，符号决定方向
+  * @param  travel: 每台的相对位移，0.1 mm，符号决定方向（组内同向同量）
   * @param  stopDistance: 距离阈值，0.1 mm
   * @param  decreasing: 1 = 距离缩到阈值以下时停（正在接近目标），0 = 反之
   * @param  speed: 接近速度，0.1 mm/s
   * @param  timeoutMs: 最长等待时间，ms
   * @retval 0 条件满足且停车帧已发出，-1 超时，-2 始终无有效数据，
-  *         -3 参数或发帧错误，-5 停车帧发送失败（机构可能还在动）
+  *         -3 参数或发帧错误，-5 至少一台停车帧发送失败
   */
-static int MoveUntilTof(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
-                        uint16_t stopDistance, uint8_t decreasing,
-                        uint32_t speed, uint32_t timeoutMs)
+static int MoveGroupUntilTof(uint8_t count, const uint8_t *motorIndices, uint8_t tofIndex,
+                             int32_t travel, uint16_t stopDistance, uint8_t decreasing,
+                             uint32_t speed, uint32_t timeoutMs)
 {
 	enum { POLL_MS = 10 };
 
 	const TofInfo *tof;
 	uint32_t elapsed = 0;
 	uint8_t everValid = 0;
-	int stopResult;
+	uint8_t stopFailed = 0;
+	uint8_t i;
 	int result = -1;
 
-	if ((motorIndex >= MOTOR_MAX_COUNT) || (tofIndex >= TOF_COUNT))
+	if ((count == 0u) || (count > MOTOR_MOVE_GROUP_MAX) || (tofIndex >= TOF_COUNT))
 	{
 		return -3;
+	}
+
+	for (i = 0; i < count; i++)
+	{
+		if (motorIndices[i] >= MOTOR_MAX_COUNT)
+		{
+			return -3;
+		}
 	}
 
 	tof = Tof_GetInfo(tofIndex);
@@ -237,15 +268,22 @@ static int MoveUntilTof(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
 		return -3;
 	}
 
-	if (Motor_SetSpeedMain(motorIndex, speed) != 0)
+	/* 先把速度全部下发完，再发位移：顺序见函数说明里的“同时启动” */
+	for (i = 0; i < count; i++)
 	{
-		return -3;
+		if (Motor_SetSpeedMain(motorIndices[i], speed) != 0)
+		{
+			return -3;
+		}
+		osDelay(MOTOR_INIT_FRAME_GAP_MS);
 	}
-	osDelay(MOTOR_INIT_FRAME_GAP_MS);
 
-	if (Motor_SetTargetPositionMain(motorIndex, travel, MOTOR_POS_RELATIVE) != 0)
+	for (i = 0; i < count; i++)
 	{
-		return -3;
+		if (Motor_SetTargetPositionMain(motorIndices[i], travel, MOTOR_POS_RELATIVE) != 0)
+		{
+			return -3;
+		}
 	}
 
 	while (elapsed < timeoutMs)
@@ -283,17 +321,37 @@ static int MoveUntilTof(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
 		result = -2;
 	}
 
-	/* 停车是安全路径：这里返回非 0 表示机构可能还在动，优先级高于上面的结果 */
-	stopResult = stopMotor(motorIndex);
-	if (stopResult != 0)
+	/* 停车是安全路径：每台都要停，任意一台失败都要报出来 */
+	for (i = 0; i < count; i++)
 	{
-		osDelay(MOTOR_HOME_SETTLE_MS);
-		return stopResult;
+		if (stopMotor(motorIndices[i]) != 0)
+		{
+			stopFailed = 1;
+		}
 	}
 
 	osDelay(MOTOR_HOME_SETTLE_MS);
 
-	return result;
+	return (stopFailed != 0u) ? -5 : result;
+}
+
+/**
+  * @brief  单台版本，参数与返回值同 MoveGroupUntilTof()。
+  * @param  motorIndex: 电机下标
+  * @param  tofIndex: TOF 下标
+  * @param  travel: 相对位移，0.1 mm，符号决定方向
+  * @param  stopDistance: 距离阈值，0.1 mm
+  * @param  decreasing: 1 = 距离缩到阈值以下时停（正在接近目标），0 = 反之
+  * @param  speed: 接近速度，0.1 mm/s
+  * @param  timeoutMs: 最长等待时间，ms
+  * @retval 0 条件满足且停车帧已发出，其余负值见 MoveGroupUntilTof()
+  */
+static int MoveUntilTof(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
+                        uint16_t stopDistance, uint8_t decreasing,
+                        uint32_t speed, uint32_t timeoutMs)
+{
+	return MoveGroupUntilTof(1u, &motorIndex, tofIndex, travel, stopDistance,
+	                         decreasing, speed, timeoutMs);
 }
 
 /**
@@ -453,8 +511,11 @@ static int ReturnAxisToOrigin(uint8_t motorIndex, uint8_t beltIndexA, uint8_t be
   *         全部重新初始化 → 全部使能 → 把此刻定义为绝对 0 →
   *         10 号绝对定位（把装置转到正前方）→
   *         9 号持续前进，直到 TOF 距离满足条件时停车 →
-  *         11 号绝对定位到 11000 →
-  *         9 号回绝对 0，同时 7/8 号按相同方向相同距离跟随。
+  *         11 号绝对定位到 110000 →
+  *         9 号回绝对 0，同时 7/8 号按相同方向相同距离跟随 →
+  *         11 号绝对定位到 10000 →
+  *         10 号绝对定位到 225000 →
+  *         7/8 号同时向后走，直到 26 号 TOF 的距离小于 5 cm。
   *         整个流程是阻塞的（逐台等归位延时与到位），期间本任务一直占着。
   *         不重试：失败只计数，由上层检查机械与参数。
   * @param  argument 未使用
@@ -479,12 +540,12 @@ static void MotorControl_Task(void const *argument)
 	   travel 与 speed 是轮缘弧长量，必须与 9 号的轮径同量级；阈值来自 TOF，
 	   是真实的毫米量，不随轮径变化（协议单位 0.1 mm，mm × 10）。
 	   返回值留在 s_lastMoveResult 里，含义见该变量的声明处。 */
-	s_lastMoveResult = (int8_t)MoveUntilTof(2, 0, 10000, 1000, 1, 500, 30000);
+	s_lastMoveResult = (int8_t)MoveUntilTof(2, 0, 10000, 1000, 1, 1000, 30000);
 
-	/* 9 号停定之后，11 号（下标 4）绝对定位到 11000。
+	/* 9 号停定之后，11 号（下标 4）绝对定位。
 	   绝对 0 是 Motor_BringUp() 末尾置零那一刻的位置，与 9 号的停车位置无关，
 	   所以这里给的是坐标值而不是相对量。11 号驱动的是钩爪类机构，行程没有
-	   可标定的直线关系，11000 按它自己的配置单位走，不代表真实毫米。
+	   可标定的直线关系，数值按它自己的配置单位走，不代表真实毫米。
 
 	   ★ 只有 9 号确实到位并停住（0）才动 11 号。超时（-1）、始终无读数（-2）、
 	     停车帧全丢（-5）时 9 号可能还在动，此时再让 11 号动作会让两台机构
@@ -496,7 +557,36 @@ static void MotorControl_Task(void const *argument)
 		/* 9 号回绝对 0，同时 7/8 号按同一物理方向走同一距离。
 		   距离由 9 号的当前坐标反推，不另外给参数；三台的符号与速度关系
 		   见 ReturnAxisToOrigin() 的说明。 */
-		s_lastReturnResult = (int8_t)ReturnAxisToOrigin(2, 0, 1, MOTOR_RETURN_TIMEOUT_MS);	}
+		s_lastReturnResult = (int8_t)ReturnAxisToOrigin(2, 0, 1, MOTOR_RETURN_TIMEOUT_MS);
+	}
+
+	/* 回原点成功后才做后面三步：那时 9 号与 7/8 都刚回到绝对 0，
+	   坐标系起点一致，后面的绝对定位才有确定含义。回原点失败就不做，
+	   避免在位置未知的情况下让别的轴动起来。 */
+	if (s_lastReturnResult == 0)
+	{
+		/* 11 号（下标 4）绝对定位到 10000 */
+		(void)Motor_SetTargetPositionMain(4, 10000, MOTOR_POS_ABSOLUTE);
+		(void)Motor_WaitArrive(4, 5000);
+
+		/* 10 号（下标 3）绝对定位到 225000 */
+		(void)Motor_SetTargetPositionMain(3, 240000, MOTOR_POS_ABSOLUTE);
+		(void)Motor_WaitArrive(3, 10000);
+
+		/* 7/8 号同时向后走，直到 26 号 TOF（下标 1）的距离小于 5 cm。
+		   阈值 500 = 50 mm × 10；decreasing = 1 表示距离缩小时停。
+		   ★ 向后（负位移）与“距离要变小”必须同时成立，这依赖 TOF 装在
+		     跟随皮带靠近目标的那一侧。若实际是反的，把 BELT_APPROACH_TRAVEL
+		     的符号翻掉即可。 */
+		{
+			static const uint8_t belts[2] = { 0u, 1u };
+
+			s_lastBeltResult = (int8_t)MoveGroupUntilTof(2u, belts, 1u,
+			                                             BELT_APPROACH_TRAVEL, 500u, 1u,
+			                                             BELT_APPROACH_SPEED,
+			                                             BELT_APPROACH_TIMEOUT_MS);
+		}
+	}
 
 	for (;;)
 	{

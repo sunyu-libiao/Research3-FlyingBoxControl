@@ -358,11 +358,11 @@ internal static class CanCommand
         return motorId switch
         {
             /* 下标 0：7 号，皮带，轮径按实测 1000mm→53mm 反算 */
-            7 => new MotorDefaults(3180, 1600, 800, false),
+            7 => new MotorDefaults(3180, 3200, 1600, false),
             /* 下标 1：8 号，另一根皮带，同一套传动；安装方向相反 */
-            8 => new MotorDefaults(3180, 1600, 800, true),
+            8 => new MotorDefaults(3180, 3200, 1600, true),
             /* 下标 2：9 号，直线机构，轮径按实测 55731.2mm→578mm 反算；反向 */
-            9 => new MotorDefaults(622, 1600, 800, true),
+            9 => new MotorDefaults(622, 3200, 1600, true),
             /* 下标 4：11 号，钩爪机构，未标定；反向 */
             11 => new MotorDefaults(UncalWheel001mm, UncalSpeed001mms, UncalAccel001mms2, true),
             /* 下标 3：10 号，未标定 */

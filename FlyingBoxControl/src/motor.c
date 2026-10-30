@@ -107,24 +107,24 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 	{
 		.reverse = 0,
 		.wheelDiameter001mm = 3180u,
-		.speed001mms = 1600u,
-		.accel001mms2 = 800u,
+		.speed001mms = 3200u,
+		.accel001mms2 = 1600u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = 0,
-		.homeSpeed001mms = 1600u,
-		.homeAccel001mms2 = 800u
+		.homeSpeed001mms = 3200u,
+		.homeAccel001mms2 = 1600u
 	},
 	/* 下标 1 / 设备号 8，控制另一根皮带滑动，安装方向相反，与 9 号同在
 	   一条水平轴上，无绝对位置需求。标定与下标 0 相同（同一套传动）。 */
 	{
 		.reverse = 1,
 		.wheelDiameter001mm = 3180u,
-		.speed001mms = 1600u,
-		.accel001mms2 = 800u,
+		.speed001mms = 3200u,
+		.accel001mms2 = 1600u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = 0,
-		.homeSpeed001mms = 1600u,
-		.homeAccel001mms2 = 800u
+		.homeSpeed001mms = 3200u,
+		.homeAccel001mms2 = 1600u
 	},
 	/* 下标 2 / 设备号 9，安装方向相反，向后找末端。
 	   这个值就是命令电机走的距离，要够从最远端走到头；等待时长也按它算，
@@ -136,12 +136,12 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 	{
 		.reverse = 1,
 		.wheelDiameter001mm = 622u,
-		.speed001mms = 1600u,
-		.accel001mms2 = 800u,
+		.speed001mms = 3200u,
+		.accel001mms2 = 1600u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = -7257,
-		.homeSpeed001mms = 1600u,
-		.homeAccel001mms2 = 800u
+		.homeSpeed001mms = 3200u,
+		.homeAccel001mms2 = 1600u
 	},
 	/* 下标 3 / 设备号 10，暂不处理 */
 	{
