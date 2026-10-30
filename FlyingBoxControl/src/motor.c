@@ -322,6 +322,7 @@ static void parseQueryResponse(const CAN_Frame *frame)
 	{
 	case MOTOR_QUERY_POSITION:
 		s_motors[motorIndex].position = (int32_t)value;
+		s_motors[motorIndex].positionRxCount++;
 		break;
 	case MOTOR_QUERY_STATUS:
 		s_motors[motorIndex].status = (uint8_t)value;

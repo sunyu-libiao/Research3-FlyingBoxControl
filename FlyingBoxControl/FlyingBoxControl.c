@@ -57,6 +57,20 @@
 #define MOTOR_STOP_FRAME_COUNT  3u
 #define MOTOR_STOP_FRAME_GAP_MS 50u
 
+/* 位置查询（0x0408 子码 0x08）的应答时限。应答本身很快，留几倍余量吸收
+   总线忙与接收任务排队。 */
+#define MOTOR_POS_QUERY_TIMEOUT_MS 200u
+
+/* 回原点等待时看剩余位移的轮询周期。0x0420 约 50 Hz，取得比它还快没有意义。 */
+#define MOTOR_RETURN_POLL_MS       20u
+
+/* 「主轴回原点 + 两根皮带同步跟随」的等待时限。按最坏行程与当前运行速度
+   估算，并留出加速段与反馈延迟的余量。 */
+#define MOTOR_RETURN_TIMEOUT_MS    15000u
+
+/* 回原点动作没执行（前一步没成功）时的记录值 */
+#define MOTOR_RETURN_SKIPPED       (-9)
+
 /* Private macro -------------------------------------------------------------*/
 /* Private variables ---------------------------------------------------------*/
 /* 电机任务的最后一次运动结果，调试时在调试器里直接看这个变量：
@@ -64,9 +78,17 @@
    -5 = 停车帧全部发送失败。 */
 static volatile int8_t s_lastMoveResult;
 
+/* 紧接着的「主轴回原点 + 皮带跟随」的结果：MOTOR_RETURN_SKIPPED = 没执行，
+   0 = 三台都已到位，其它负值见 ReturnAxisToOrigin() 的返回码。 */
+static volatile int8_t s_lastReturnResult = MOTOR_RETURN_SKIPPED;
+
 /* Private function prototypes -----------------------------------------------*/
 static int SystemClock_Config(void);
 static int stopMotor(uint8_t motorIndex);
+static int readPosition(uint8_t motorIndex, int32_t *position, uint32_t timeoutMs);
+static uint8_t isNearTarget(int32_t remain);
+static int ReturnAxisToOrigin(uint8_t motorIndex, uint8_t beltIndexA, uint8_t beltIndexB,
+                              uint32_t timeoutMs);
 static int MoveUntilTof(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
                         uint16_t stopDistance, uint8_t decreasing,
                         uint32_t speed, uint32_t timeoutMs);
@@ -275,12 +297,164 @@ static int MoveUntilTof(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
 }
 
 /**
+  * @brief  剩余位移是否已经落进到位死区。
+  * @param  remain: 剩余位移，0.1 mm
+  * @retval 1 在死区内，0 还有余量
+  */
+static uint8_t isNearTarget(int32_t remain)
+{
+	return ((remain <= MOTOR_ARRIVE_DEADBAND) &&
+	        (remain >= -MOTOR_ARRIVE_DEADBAND)) ? 1u : 0u;
+}
+
+/**
+  * @brief  读一台电机的绝对位置：发 0x0408 子码 0x08，等 0x0409 应答。
+  *
+  *         ★ 不能用 lastRxTick 判新鲜。那个时间戳被任何一帧刷新（心跳、
+  *           剩余位移、力矩都是几十到上百 Hz），拿到的是"最近有帧"，不是
+  *           "最近有位置应答"。所以靠 positionRxCount 前进来判断：它只在
+  *           子码 0x08 的应答里递增。
+  * @param  motorIndex: 电机下标
+  * @param  position: 输出，0.1 mm，同一坐标系下带符号
+  * @param  timeoutMs: 等应答的时限
+  * @retval 0 读到新应答，-1 参数错/发帧失败/超时
+  */
+static int readPosition(uint8_t motorIndex, int32_t *position, uint32_t timeoutMs)
+{
+	const MotorInfo *info;
+	uint32_t elapsed = 0;
+	uint32_t before;
+
+	info = Motor_GetInfo(motorIndex);
+	if (info == NULL)
+	{
+		return -1;
+	}
+
+	before = info->positionRxCount;
+	if (Motor_QueryPosition(motorIndex) != 0)
+	{
+		return -1;
+	}
+
+	while (elapsed < timeoutMs)
+	{
+		if (info->positionRxCount != before)
+		{
+			*position = info->position;
+			return 0;
+		}
+
+		osDelay(MOTOR_RETURN_POLL_MS);
+		elapsed += MOTOR_RETURN_POLL_MS;
+	}
+
+	return -1;
+}
+
+/**
+  * @brief  主轴回绝对 0，同时两根皮带按同一物理方向走同一距离。
+  *
+  *         距离不是外部给的，而是由主轴当前绝对位置反推：它要回到 0，
+  *         走的就是「0 − 当前位置」，三台都走这一段，机构才是刚性一起动。
+  *         所以必须先读位置——0x0420 报的是"到目标的剩余量"，给不出绝对值。
+  *
+  *         三台的位移取同一个数：三台的轮径都已按实测标定，协议单位统一是
+  *         真实行程的 0.1 mm，同一个数值就是同样的物理距离，与各自轮径无关。
+  *
+  *         ★ 符号：本机三台的 reverse 与安装方向已调到"正数 = 同一物理方向"，
+  *           因此主轴朝 0 走的方向（−当前位置）直接就是皮带该走的相对量。
+  *           若以后改了三台的 reverse 组合，这里的符号要跟着重算。
+  *
+  *         ★ 主轴的速度要先恢复。MoveUntilTof() 把它的速度降成接近速度后
+  *           没有还原，不还原的话它比两根皮带慢，三者不会同步。
+  *
+  *         三帧背靠背发出，让它们几乎同时启动；到位判定在一个循环里同时看
+  *         三台的剩余位移。不能串行等：串行等完第一台时另外两台早已就位，
+  *           再调 Motor_WaitArrive() 会因为没有观察到"它在动"而白等到超时。
+  * @param  motorIndex: 主轴下标
+  * @param  beltIndexA: 皮带 A 下标
+  * @param  beltIndexB: 皮带 B 下标
+  * @param  timeoutMs: 等待三台到位的最长时间
+  * @retval 0 三台都已到位，-1 参数错，-2 读不到主轴位置，-3 发帧失败，
+  *         -4 超时（至少一台没到位）
+  */
+static int ReturnAxisToOrigin(uint8_t motorIndex, uint8_t beltIndexA, uint8_t beltIndexB,
+                              uint32_t timeoutMs)
+{
+	const MotorInfo *axis;
+	const MotorInfo *beltA;
+	const MotorInfo *beltB;
+	uint32_t elapsed = 0;
+	int32_t position;
+	int32_t travel;
+	uint8_t moving = 0;
+
+	axis = Motor_GetInfo(motorIndex);
+	beltA = Motor_GetInfo(beltIndexA);
+	beltB = Motor_GetInfo(beltIndexB);
+	if ((axis == NULL) || (beltA == NULL) || (beltB == NULL))
+	{
+		return -1;
+	}
+
+	if (readPosition(motorIndex, &position, MOTOR_POS_QUERY_TIMEOUT_MS) != 0)
+	{
+		return -2;
+	}
+
+	travel = -position;
+	if ((travel <= MOTOR_ARRIVE_DEADBAND) && (travel >= -MOTOR_ARRIVE_DEADBAND))
+	{
+		/* 已经在原点附近，三台都不用动 */
+		return 0;
+	}
+
+	/* 恢复主轴运行速度，否则它比两根皮带慢，同步就无从谈起 */
+	if (Motor_SetSpeedMain(motorIndex, axis->speed001mms) != 0)
+	{
+		return -3;
+	}
+	osDelay(MOTOR_INIT_FRAME_GAP_MS);
+
+	/* 三帧连续发出：主轴绝对 0，两根皮带同一相对位移 */
+	if ((Motor_SetTargetPositionMain(motorIndex, 0, MOTOR_POS_ABSOLUTE) != 0) ||
+	    (Motor_SetTargetPositionMain(beltIndexA, travel, MOTOR_POS_RELATIVE) != 0) ||
+	    (Motor_SetTargetPositionMain(beltIndexB, travel, MOTOR_POS_RELATIVE) != 0))
+	{
+		return -3;
+	}
+
+	/* 等三台同时到位。必须见过至少一台"确实在动"之后，才承认全部进入死区，
+	   否则命令刚发出时读到的旧剩余值（0）会被当成"已经到位"。 */
+	while (elapsed < timeoutMs)
+	{
+		if ((isNearTarget(axis->remainMain) == 0u) ||
+		    (isNearTarget(beltA->remainMain) == 0u) ||
+		    (isNearTarget(beltB->remainMain) == 0u))
+		{
+			moving = 1;
+		}
+		else if (moving != 0u)
+		{
+			return 0;
+		}
+
+		osDelay(MOTOR_RETURN_POLL_MS);
+		elapsed += MOTOR_RETURN_POLL_MS;
+	}
+
+	return -4;
+}
+
+/**
   * @brief  电机任务。上电后一次性跑完启动流程，然后做测试动作并待命：
   *         等电机复位 → 9 号单独初始化并归位 → 11 号单独初始化并归位 →
   *         全部重新初始化 → 全部使能 → 把此刻定义为绝对 0 →
   *         10 号绝对定位（把装置转到正前方）→
   *         9 号持续前进，直到 TOF 距离满足条件时停车 →
-  *         11 号绝对定位到 11000。
+  *         11 号绝对定位到 11000 →
+  *         9 号回绝对 0，同时 7/8 号按相同方向相同距离跟随。
   *         整个流程是阻塞的（逐台等归位延时与到位），期间本任务一直占着。
   *         不重试：失败只计数，由上层检查机械与参数。
   * @param  argument 未使用
@@ -319,7 +493,10 @@ static void MotorControl_Task(void const *argument)
 	{
 		(void)Motor_SetTargetPositionMain(4, 110000, MOTOR_POS_ABSOLUTE);
 		(void)Motor_WaitArrive(4, 5000);
-	}
+		/* 9 号回绝对 0，同时 7/8 号按同一物理方向走同一距离。
+		   距离由 9 号的当前坐标反推，不另外给参数；三台的符号与速度关系
+		   见 ReturnAxisToOrigin() 的说明。 */
+		s_lastReturnResult = (int8_t)ReturnAxisToOrigin(2, 0, 1, MOTOR_RETURN_TIMEOUT_MS);	}
 
 	for (;;)
 	{

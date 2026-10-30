@@ -210,6 +210,9 @@ typedef struct
 
 	/* 0x0409 查询应答：Data[0]=devId, Data[1]=子码, Data[2..]=载荷 */
 	int32_t  position;          /* 子码 0x08 当前位置，0.1 mm；0x0420 给不出绝对值 */
+	uint32_t positionRxCount;   /* 子码 0x08 应答计数。判"读到的位置是新值"只能靠它：
+	                               lastRxTick 被心跳/剩余位移/力矩以几十到上百 Hz 刷新，
+	                               那只是“最近有帧”，不代表“最近有位置应答” */
 	uint8_t  status;            /* 子码 0x25 状态位，MOTOR_STATUS_* */
 	int16_t  temperature;       /* 子码 0x06，0.1 °C */
 	uint32_t firmware;          /* 子码 0xFF */
