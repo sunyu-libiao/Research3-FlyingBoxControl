@@ -135,6 +135,16 @@ void Tof_InitTaskCreate(void);
 /* 初始化结果：0 成功，-1 至少一帧发送失败，TOF_INIT_PENDING 还没跑完。 */
 int Tof_GetInitResult(void);
 
+/* 距离轮询任务的周期，ms。模块只在被请求时回一帧距离，要持续拿到数据
+   就得周期发通道 12 请求。这条路径不受“自动上报会自行停止”的影响。 */
+#define TOF_POLL_PERIOD_MS      10u
+
+/* 创建一个常驻任务，按 TOF_POLL_PERIOD_MS 循环向每个模块请求一次距离，
+   应答由 Tof_ParseFrame() 写进 TofInfo。
+   ★ 必须在 Tof_InitTaskCreate() 之后创建：模块收到 0x0316 之前不应答请求，
+     本任务会先等初始化结果再开始发。 */
+void Tof_PollTaskCreate(void);
+
 /* 0x0408 通道 10：连续测距开关，enable 非 0 开。
    实测：开之后模块以 0x0793 自动上报，但**大约 10 秒后自行停止**，
    要维持数据流必须周期重发（建议 ≤5 s），或改用通道 12 主动查询。 */

@@ -165,6 +165,7 @@ int main(void)
 		Tof_Init();            /* 两个协议共存：can 依次交给所有已注册回调 */
 		CAN_RxTaskCreate();    /* 先建接收任务：初始化帧的 ACK 才有任务去消化 */
 		Tof_InitTaskCreate();  /* TOF 配置帧放到调度器启动后 */
+		Tof_PollTaskCreate();  /* 配置完成后按固定周期请求距离 */
 		MotorControl_TaskCreate();  /* 电机启动流程：归位 → 初始化 → 使能 → 置零 */
 	}
 

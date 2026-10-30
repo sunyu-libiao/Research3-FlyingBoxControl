@@ -49,6 +49,7 @@
 #define TOF_REPORT_MIN_LEN      3
 
 #define TOF_INIT_STACK_SIZE     128     /* 字                          */
+#define TOF_POLL_STACK_SIZE     128     /* 字：每轮只拼两帧就睡，很浅   */
 
 /* Private variables ---------------------------------------------------------*/
 static TofInfo s_tofs[TOF_MAX_COUNT];
@@ -74,6 +75,7 @@ static void storeDistance(uint8_t index, uint16_t raw);
 static void parseResponse(const CAN_Frame *frame);
 static void parseReport(const CAN_Frame *frame);
 static void Tof_InitTask(void const *argument);
+static void Tof_PollTask(void const *argument);
 
 /* Private functions ---------------------------------------------------------*/
 
@@ -478,4 +480,54 @@ static void Tof_InitTask(void const *argument)
 
 	s_initResult = Tof_ConfigAll();
 	vTaskDelete(NULL);
+}
+
+/**
+  * @brief  距离轮询任务：按 TOF_POLL_PERIOD_MS 周期向每个模块请求一次读数。
+  *
+  *         模块不会主动推送数据（连续上报模式会自行停止，不可靠），只能主动
+  *         发通道 12 请求，应答由 CAN 接收任务写进 TofInfo。本任务只负责发请求。
+  *
+  *         用 osDelayUntil 而不是 osDelay：前者的下一个唤醒时刻是“上上次 +
+  *         周期”，发送耗时与调度抖动不会累积成周期漂移；后者会让实际周期
+  *         变成“周期 + 每轮开销”。
+  *
+  *         ★ 周期快于模块自身的测量频率时，相邻两次应答会拿到同一个读数
+  *           （序号不增）。要判断数据是否真的刷新，看 TofInfo.seq 是否变化。
+  * @param  argument 未使用
+  * @retval None
+  */
+static void Tof_PollTask(void const *argument)
+{
+	uint8_t i;
+	uint32_t wakeTick = osKernelSysTick();
+
+	(void) argument;
+
+	/* 模块收到 0x0316 之前不应答测距请求，先等初始化任务跑完 */
+	while (Tof_GetInitResult() == TOF_INIT_PENDING)
+	{
+		osDelay(TOF_POLL_PERIOD_MS);
+	}
+
+	for (;;)
+	{
+		for (i = 0; i < TOF_COUNT; i++)
+		{
+			(void)Tof_RequestDistance(i);
+		}
+
+		osDelayUntil(&wakeTick, TOF_POLL_PERIOD_MS);
+	}
+}
+
+/**
+  * @brief  创建距离轮询任务。调度器启动后才会真正跑。
+  * @param  None
+  * @retval None
+  */
+void Tof_PollTaskCreate(void)
+{
+	osThreadDef(TofPoll, Tof_PollTask, osPriorityNormal, 0, TOF_POLL_STACK_SIZE);
+	osThreadCreate(osThread(TofPoll), NULL);
 }
