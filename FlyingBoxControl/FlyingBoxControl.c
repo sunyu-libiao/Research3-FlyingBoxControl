@@ -42,10 +42,31 @@
 #define MOTOR_CTRL_STACK_SIZE   224     /* 字：Motor_BringUp 内部要发帧 + osDelay */
 #define MOTOR_CTRL_IDLE_MS      500     /* 启动完成后待命周期                    */
 
+/* 停车用的相对位移增量，协议单位（轮缘弧长，对已标定的轮径就是 0.1 mm 量级）。
+   ★ 实测发 0 停不住：电机不认零位移，命令被丢掉，机构继续跑到行程尽头。
+     doc/电机控制流程.md 里也有旁证——非零相对目标都会回 0x0100 受理帧，
+     相对 0 位移不会回。所以用一个"几乎为零但不为零"的增量，让目标落到
+     当前位置旁边，电机随即减速停住。
+   ★ 不能大：增量本身就是新的剩余位移，越大停得越晚、超调越多。
+   试 1 不行就试 5，再不行说明相对命令这条路走不通，需要改用绝对定位。 */
+#define MOTOR_STOP_DELTA        1
+
+/* 停车帧的发送次数与间隔。相对命令每帧都重新取"当前位置 + Δ"作为目标，
+   不累加，重复发最多让机构多走 Δ 那一点点，所以可以用多帧冗余提高送达
+   概率：bxCAN 是单次发送（NART = 1），丢一帧就是真丢。 */
+#define MOTOR_STOP_FRAME_COUNT  3u
+#define MOTOR_STOP_FRAME_GAP_MS 50u
+
 /* Private macro -------------------------------------------------------------*/
 /* Private variables ---------------------------------------------------------*/
+/* 电机任务的最后一次运动结果，调试时在调试器里直接看这个变量：
+   0 = 距离到阈值且停车帧已发出，-1 = 超时，-2 = 始终无有效读数，
+   -5 = 停车帧全部发送失败。 */
+static volatile int8_t s_lastMoveResult;
+
 /* Private function prototypes -----------------------------------------------*/
 static int SystemClock_Config(void);
+static int stopMotor(uint8_t motorIndex);
 static int MoveUntilTof(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
                         uint16_t stopDistance, uint8_t decreasing,
                         uint32_t speed, uint32_t timeoutMs);
@@ -92,28 +113,75 @@ static int SystemClock_Config(void)
 }
 
 /**
-  * @brief  让一台电机持续运动，直到 TOF 测得的距离满足条件时停住。
+  * @brief  发停车命令：相对一个极小增量，把目标拉到当前位置旁边。
+  *
+  *         相对命令的语义是「目标 = 收到帧那一刻的当前位置 + Δ」。
+  *
+  *         ★ 不能用 Δ = 0。实测三帧 00 00 00 00 09 00 确实上线了，电机不停；
+  *           doc/电机控制流程.md 也记着非零相对目标才回 0x0100 受理帧，
+  *           零位移根本不进运动状态机。所以取一个非零但极小的 Δ。
+  *
+  *         Δ 的符号按剩余位移的方向取：remain = 目标 − 当前位置，为正说明
+  *         目标在前方、机构正在向正向运动，此时 Δ 也取正，新目标刚好落在
+  *         当前位置前方一点。符号反了会让电机先朝反方向走一小段。
+  *
+  *         ★ 不要改成发「−剩余」。那样新目标会落到「当前位置 − 剩余」，
+  *           电机反而朝反方向走一整段，实测表现为到点后前后震一下、之后
+  *           接着跑。
+  * @param  motorIndex: 电机下标
+  * @retval 0 至少一帧已发出，-1 参数错，-5 全部发送失败
+  */
+static int stopMotor(uint8_t motorIndex)
+{
+	const MotorInfo *info;
+	int32_t delta;
+	uint8_t attempt;
+	uint8_t sent = 0;
+
+	info = Motor_GetInfo(motorIndex);
+	if (info == NULL)
+	{
+		return -1;
+	}
+
+	/* 运动方向由剩余位移的符号给出：负剩余说明目标在后方 */
+	delta = (info->remainMain < 0) ? -MOTOR_STOP_DELTA : MOTOR_STOP_DELTA;
+
+	for (attempt = 0; attempt < MOTOR_STOP_FRAME_COUNT; attempt++)
+	{
+		if (Motor_SetTargetPositionMain(motorIndex, delta, MOTOR_POS_RELATIVE) == 0)
+		{
+			sent = 1;
+		}
+
+		osDelay(MOTOR_STOP_FRAME_GAP_MS);
+	}
+
+	return (sent != 0u) ? 0 : -5;
+}
+
+/**
+  * @brief  让一台电机持续运动，直到 TOF 测得的距离到达阈值时停住。
   *
   *         协议里没有“停止”指令，也没有速度模式，所以做法是：先发一段
-  *         足够长的相对位移让它自己跑，条件满足后把目标改成“当前位置”
-  *         （相对 0）令其减速停车。
+  *         足够长的相对位移让它自己跑，条件满足后再让它的目标回到当前位置
+  *         （相对 0 位移），做法见 stopMotor() 的说明。
   *
-  *         判据只看两件事：最近一帧读数 valid，且它确实是一帧新的（seq 变化）。
-  *         只看 distance 会被两种情况骗过：无效读数下 distance 是 0（看起来
-  *         “距离已很小”），以及同一帧被反复读到。
+  *         判据只有一条：读数 valid 且距离已经达到阈值。到了就发停车指令。
+  *         valid 必须查——无效读数下 distance 被置 0，会被当成“已经贴到目标”，
+  *         一启动就停。
   *
-  *         ★ 不要在这里加“样本不超过 N ms 才算数”这类新鲜度窗口：上报周期由
-  *           模块自己掌控，且会变；窗口比实际周期短时判据永远不过，表现就是
-  *           距离早就够了却一直不停。新鲜度不是停车判据应该关心的事。
+  *         不要求“必须是新的一帧”：距离已经到了就该停，同一帧重复读到并不
+  *         改变这个事实；而漏停的代价是撞机。
   *
-  *         不要求连续多帧满足：上报周期不确定，要求几帧就至少多等几个周期，
-  *         速度快时可能整段错过窗口，而漏停的代价是撞机。
+  *         不再限制读数新鲜度：上报周期由模块自己掌控且会变，拿一个固定窗口
+  *         去卡它，窗口比实际周期短时判据永远不过，表现就是距离早就够了却
+  *         一直不停。循环由 timeoutMs 兜底，不会永久卡死。
   *
-  *         反向失效保护：曾经看到过读数、之后又连续看不到，就当作目标已经
-  *         不可见（例如已经近过模块量程下限），立即停车。一直盲走只会更近。
-  *
-  *         无论怎么退出都会发出停车命令。返回后这台电机内部的速度是 speed，
-  *         结构体里的 speed001mms 并未改变，要恢复运行参数得重新 Motor_InitAll()。
+  *         停车由 stopMotor() 负责；它的帧没能发出时返回 -5。本函数不确认
+  *         电机是否真的停住——帧发出去了不等于电机执行了。
+  *         返回后这台电机内部的速度是 speed，结构体里的 speed001mms 并未改变，
+  *         要恢复运行参数得重新 Motor_InitAll()。
   * @param  motorIndex: 电机下标
   * @param  tofIndex: TOF 下标
   * @param  travel: 相对位移，0.1 mm，符号决定方向
@@ -121,28 +189,19 @@ static int SystemClock_Config(void)
   * @param  decreasing: 1 = 距离缩到阈值以下时停（正在接近目标），0 = 反之
   * @param  speed: 接近速度，0.1 mm/s
   * @param  timeoutMs: 最长等待时间，ms
-  * @retval 0 条件满足已停，-1 超时，-2 始终无有效数据，-3 参数或发帧错误，
-  *         -4 读数丢失（曾有过、后来没了）
+  * @retval 0 条件满足且停车帧已发出，-1 超时，-2 始终无有效数据，
+  *         -3 参数或发帧错误，-5 停车帧发送失败（机构可能还在动）
   */
 static int MoveUntilTof(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
                         uint16_t stopDistance, uint8_t decreasing,
                         uint32_t speed, uint32_t timeoutMs)
 {
-	enum
-	{
-		POLL_MS = 10,
-		/* 曾经看到过有效读数、之后又断了这么久，就当目标已不可见，停车。
-		   取“多久算断”而不是“多久算新”：断流持续存在时，只有这种方向
-		   的判据能保证机构最终会停下来。 */
-		SAMPLE_LOST_MS = 2000
-	};
+	enum { POLL_MS = 10 };
 
 	const TofInfo *tof;
 	uint32_t elapsed = 0;
-	uint32_t lastSampleTick = 0;
-	uint8_t lastSeq = 0;
-	uint8_t haveSeq = 0;
-	uint8_t seen = 0;
+	uint8_t everValid = 0;
+	int stopResult;
 	int result = -1;
 
 	if ((motorIndex >= MOTOR_MAX_COUNT) || (tofIndex >= TOF_COUNT))
@@ -169,54 +228,47 @@ static int MoveUntilTof(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
 
 	while (elapsed < timeoutMs)
 	{
+		/* valid 必须查：无效读数下 distance 被置 0，会被当成“已经贴到目标” */
 		if (tof->valid != 0)
 		{
-			seen = 1;
-			lastSampleTick = HAL_GetTick();
+			uint8_t reached;
 
-			/* 同一帧只判一次：seq 不变说明模块还没测出新值 */
-			if ((haveSeq == 0) || (tof->seq != lastSeq))
+			everValid = 1;
+
+			if (decreasing != 0)
 			{
-				uint8_t reached;
-
-				haveSeq = 1;
-				lastSeq = tof->seq;
-
-				if (decreasing != 0)
-				{
-					reached = (tof->distance <= stopDistance) ? 1u : 0u;
-				}
-				else
-				{
-					reached = (tof->distance >= stopDistance) ? 1u : 0u;
-				}
-
-				if (reached != 0)
-				{
-					result = 0;
-					break;
-				}
+				reached = (tof->distance <= stopDistance) ? 1u : 0u;
 			}
-		}
-		else if ((seen != 0) &&
-		         ((HAL_GetTick() - lastSampleTick) >= SAMPLE_LOST_MS))
-		{
-			result = -4;
-			break;
+			else
+			{
+				reached = (tof->distance >= stopDistance) ? 1u : 0u;
+			}
+
+			if (reached != 0)
+			{
+				result = 0;
+				break;
+			}
 		}
 
 		osDelay(POLL_MS);
 		elapsed += POLL_MS;
 	}
 
-	/* 区分“始终没数据”和“有数据但没满足条件” */
-	if ((result != 0) && (haveSeq == 0))
+	/* 区分“始终没数据”和“有数据但没到阈值” */
+	if ((result != 0) && (everValid == 0))
 	{
 		result = -2;
 	}
 
-	/* 所有退出路径都要停：不改目标的话电机会一直跑到行程尽头 */
-	(void)Motor_SetTargetPositionMain(motorIndex, 0, MOTOR_POS_RELATIVE);
+	/* 停车是安全路径：这里返回非 0 表示机构可能还在动，优先级高于上面的结果 */
+	stopResult = stopMotor(motorIndex);
+	if (stopResult != 0)
+	{
+		osDelay(MOTOR_HOME_SETTLE_MS);
+		return stopResult;
+	}
+
 	osDelay(MOTOR_HOME_SETTLE_MS);
 
 	return result;
@@ -250,8 +302,9 @@ static void MotorControl_Task(void const *argument)
 	/* 测试：9 号（下标 2）持续前进，直到 25 号 TOF（下标 0）测得的距离缩到阈值。
 	   前进时距离变小，所以 decreasing 传 1；方向反了就把 travel 的符号翻掉。
 	   travel 与 speed 是轮缘弧长量，必须与 9 号的轮径同量级；阈值来自 TOF，
-	   是真实的毫米量，不随轮径变化。 */
-	(void)MoveUntilTof(2, 0, 10367, 3000, 1, 259, 30000);
+	   是真实的毫米量，不随轮径变化（协议单位 0.1 mm，mm × 10）。
+	   返回值留在 s_lastMoveResult 里，含义见该变量的声明处。 */
+	s_lastMoveResult = (int8_t)MoveUntilTof(2, 0, 10367, 900, 1, 259, 30000);
 
 	for (;;)
 	{
