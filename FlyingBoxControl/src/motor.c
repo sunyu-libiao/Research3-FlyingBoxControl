@@ -69,13 +69,11 @@
 
 #define MOTOR_ARM_SLOT_MAX      6       /* Data[2~7] 能放几个设备号 */
 #define MOTOR_SN_LEN            7
-#define MOTOR_INIT_STACK_SIZE   128     /* 字：Motor_InitAll + CAN_Send */
 
 /* Private variables ---------------------------------------------------------*/
 static MotorInfo s_motors[MOTOR_MAX_COUNT];
 static uint16_t s_lastErrorCode;
 static uint32_t s_errorFrameCount;
-static int s_initResult = MOTOR_INIT_PENDING;
 
 /* 每台电机一份默认配置模板（Flash）。下标与状态表一致：0 -> 设备号 MOTOR_DEV_BASE。
    只填配置区，状态区隐式为 0；Motor_Init() 整份拷入 s_motors 后成为可读的
@@ -101,45 +99,53 @@ static int s_initResult = MOTOR_INIT_PENDING;
 
 static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 {
-	/* 下标 0 / 设备号 7 */
+	/* 下标 0 / 设备号 7，无绝对位置需求 */
 	{
 		.reverse = 0,
-		.wheelDiameter001mm = 10000u,
-		.speed001mms = 2000u,
-		.accel001mms2 = 4000u,
-		.params = { MOTOR_PARAMS_DEFAULT }
+		.wheelDiameter001mm = 60000u,
+		.speed001mms = 80000u,
+		.accel001mms2 = 40000u,
+		.params = { MOTOR_PARAMS_DEFAULT },
+		.homeTravel001mm = 0
 	},
-	/* 下标 1 / 设备号 8，安装方向相反 */
+	/* 下标 1 / 设备号 8，安装方向相反，无绝对位置需求 */
 	{
 		.reverse = 1,
-		.wheelDiameter001mm = 10000u,
-		.speed001mms = 2000u,
-		.accel001mms2 = 4000u,
-		.params = { MOTOR_PARAMS_DEFAULT }
+		.wheelDiameter001mm = 60000u,
+		.speed001mms = 80000u,
+		.accel001mms2 = 40000u,
+		.params = { MOTOR_PARAMS_DEFAULT },
+		.homeTravel001mm = 0
 	},
-	/* 下标 2 / 设备号 9，安装方向相反 */
+	/* 下标 2 / 设备号 9，安装方向相反，向后找末端。
+	   -450000（600 mm 轮径下的 45000 mm 轮缘行程，约对应实际 1.5 m）
+	   就是命令电机走的距离，经验上实走 1.5 m 够从最远端走到头。
+	   等待时长同样按它算，所以不能多填。 */
 	{
 		.reverse = 1,
-		.wheelDiameter001mm = 10000u,
-		.speed001mms = 2000u,
-		.accel001mms2 = 4000u,
-		.params = { MOTOR_PARAMS_DEFAULT }
+		.wheelDiameter001mm = 60000u,
+		.speed001mms = 80000u,
+		.accel001mms2 = 40000u,
+		.params = { MOTOR_PARAMS_DEFAULT },
+		.homeTravel001mm = -700000
 	},
-	/* 下标 3 / 设备号 10 */
+	/* 下标 3 / 设备号 10，暂不处理 */
 	{
 		.reverse = 0,
-		.wheelDiameter001mm = 10000u,
-		.speed001mms = 2000u,
-		.accel001mms2 = 4000u,
-		.params = { MOTOR_PARAMS_DEFAULT }
+		.wheelDiameter001mm = 60000u,
+		.speed001mms = 80000u,
+		.accel001mms2 = 40000u,
+		.params = { MOTOR_PARAMS_DEFAULT },
+		.homeTravel001mm = -1000000
 	},
-	/* 下标 4 / 设备号 11，安装方向相反 */
+	/* 下标 4 / 设备号 11，安装方向相反，向后找末端 */
 	{
 		.reverse = 1,
-		.wheelDiameter001mm = 10000u,
-		.speed001mms = 2000u,
-		.accel001mms2 = 4000u,
-		.params = { MOTOR_PARAMS_DEFAULT }
+		.wheelDiameter001mm = 60000u,
+		.speed001mms = 80000u,
+		.accel001mms2 = 40000u,
+		.params = { MOTOR_PARAMS_DEFAULT },
+		.homeTravel001mm = -400000
 	}
 };
 
@@ -152,7 +158,8 @@ static uint8_t findIndexByMotor(uint8_t motorId);
 static void touchMotor(uint8_t motorIndex);
 static int sendQuery(uint8_t motorIndex, uint8_t queryKind);
 static void parseQueryResponse(const CAN_Frame *frame);
-static void Motor_InitTask(void const *argument);
+static uint32_t homeWaitMsFor(int32_t travel);
+static int configOneMotor(uint8_t motorIndex, uint32_t speed001mms, uint32_t accel001mms2);
 
 /* Private functions ---------------------------------------------------------*/
 
@@ -351,11 +358,90 @@ void Motor_Init(void)
 }
 
 /**
-  * @brief  按下标初始化全部电机，载荷全部取自对应 MotorInfo 的配置区：
-  *         参数 → 轮径 → 加速度 → 速度 → 使能。
-  *         SN 已在电机侧固化，不再绑定。
+  * @brief  按归位行程 / 归位速度 / 归位加速度估算走完该行程的耗时，单位 ms。
+  *
+  *         梯形速度曲线：
+  *           d_acc = v^2 / (2a)      加速段走的距离
+  *           t_acc = v / a           加速段耗时
+  *           d <= d_acc → 全程都在加速，实际耗时 sqrt(2d/a) <= t_acc，
+  *                        取 t_acc 作为上界；
+  *           d >  d_acc → t_acc + (d - d_acc) / v。
+  *
+  *         距离取 homeTravel001mm 的绝对值——把它当作电机实际要走的距离，
+  *         不需要知道机械尺寸。全部用 0.1 mm 系列单位，比值无量纲，乘 1000
+  *         换算成毫秒。这里不加额外余量：余量靠 homeTravel001mm 多填。
+  *
+  *         ★ 加速段距离含 v^2，按当前轮径下的速度值（1.5e5）已超出 32 位，
+  *           必须用 64 位算，否则得出发散的结果。
+  * @param  travel: homeTravel001mm，0.1 mm，符号无关
+  * @retval 估算耗时，ms
+  */
+static uint32_t homeWaitMsFor(int32_t travel)
+{
+	uint32_t distance = (uint32_t)((travel < 0) ? -travel : travel);
+	uint32_t accelMs = (MOTOR_HOME_SPEED_001MMS * 1000u) / MOTOR_HOME_ACCEL_001MMS2;
+	uint32_t accelDist = (uint32_t)(((uint64_t)MOTOR_HOME_SPEED_001MMS * MOTOR_HOME_SPEED_001MMS) /
+	                                (2u * MOTOR_HOME_ACCEL_001MMS2));
+
+	if (distance <= accelDist)
+	{
+		return accelMs;
+	}
+
+	return accelMs +
+	       (((distance - accelDist) * 1000u) / MOTOR_HOME_SPEED_001MMS);
+}
+
+/**
+  * @brief  给单台电机下发完整配置：参数 → 轮径 → 加速度 → 速度。
+  *         速度与加速度由调用方给：归位阶段要用比运行值低得多的参数，
+  *         否则小轮径下高速启动的电流峰值会直接触发过流保护。
+  *         每帧之间插 MOTOR_INIT_FRAME_GAP_MS，会 osDelay。
+  * @param  motorIndex: 下标
+  * @param  speed001mms: 0x0415 速度，0.1 mm/s
+  * @param  accel001mms2: 0x0414 加速度，0.1 mm/s^2
+  * @retval 0 所有帧已发出，-1 至少一帧发送失败
+  */
+static int configOneMotor(uint8_t motorIndex, uint32_t speed001mms, uint32_t accel001mms2)
+{
+	int result = 0;
+
+	if (Motor_ConfigParams(motorIndex) != 0)
+	{
+		result = -1;
+	}
+	osDelay(MOTOR_INIT_FRAME_GAP_MS);
+
+	if (Motor_ConfigWheelDiameter(motorIndex, s_motors[motorIndex].wheelDiameter001mm) != 0)
+	{
+		result = -1;
+	}
+	osDelay(MOTOR_INIT_FRAME_GAP_MS);
+
+	if (Motor_SetAccelerationMain(motorIndex, accel001mms2) != 0)
+	{
+		result = -1;
+	}
+	osDelay(MOTOR_INIT_FRAME_GAP_MS);
+
+	if (Motor_SetSpeedMain(motorIndex, speed001mms) != 0)
+	{
+		result = -1;
+	}
+	osDelay(MOTOR_INIT_FRAME_GAP_MS);
+
+	return result;
+}
+
+/**
+  * @brief  按下标配置全部电机（运行参数）：参数 → 轮径 → 加速度 → 速度。
+  *         载荷全部取自对应 MotorInfo 的配置区。SN 已在电机侧固化，不再绑定。
+  *
+  *         ★ 这里不发使能帧（0x0413）。使能由 Motor_BringUp() 统一发，
+  *           这样才能控制某一时刻到底有哪几台在出力。
+  *
   *         每帧之间插 MOTOR_INIT_FRAME_GAP_MS：电机处理参数/轮径写入需要时间，
-  *         连续帧贴在一起时后面的帧会被忽略，表现为部分电机使能不了。
+  *         连续帧贴在一起时后面的帧会被忽略，表现为部分电机收不到配置。
   *         本函数会 osDelay，只能在任务上下文调用。
   * @param  None
   * @retval 0 所有帧已发出，-1 至少一帧发送失败
@@ -367,79 +453,164 @@ int Motor_InitAll(void)
 
 	for (i = 0; i < MOTOR_COUNT; i++)
 	{
-		if (Motor_ConfigParams(i) != 0)
+		if (configOneMotor(i, s_motors[i].speed001mms, s_motors[i].accel001mms2) != 0)
 		{
 			result = -1;
 		}
-		osDelay(MOTOR_INIT_FRAME_GAP_MS);
-
-		if (Motor_ConfigWheelDiameter(i, s_motors[i].wheelDiameter001mm) != 0)
-		{
-			result = -1;
-		}
-		osDelay(MOTOR_INIT_FRAME_GAP_MS);
-
-		if (Motor_SetAccelerationMain(i, s_motors[i].accel001mms2) != 0)
-		{
-			result = -1;
-		}
-		osDelay(MOTOR_INIT_FRAME_GAP_MS);
-
-		if (Motor_SetSpeedMain(i, s_motors[i].speed001mms) != 0)
-		{
-			result = -1;
-		}
-		osDelay(MOTOR_INIT_FRAME_GAP_MS);
-
-		if (Motor_SetEnabled(i, 1) != 0)
-		{
-			result = -1;
-		}
-		osDelay(MOTOR_INIT_FRAME_GAP_MS);
 	}
 
 	return result;
 }
 
+
 /**
-  * @brief  创建一次性初始化任务。调度器启动后才会真正跑，因此不在
-  *         osKernelStart() 之前占用主线程，也不阻塞 LED 与接收任务。
-  * @param  None
-  * @retval None
+  * @brief  单台归位：初始化这一台 → 使能 → 按 homeTravel001mm 发相对位移 →
+  *         按同一段距离推算出的时间定时等待 → 清除残留目标 → 把位置定义成 0。
+  *
+  *         先重新初始化而不是沿用已有参数：电机上一次归位顶到末端触发过
+  *         保护释放，内部的参数与输出级状态已不可信，必须重发 0x0316/0x0408
+  *         才能正常驱动。这里用的是归位专用的低速低加速，跑正常运动前必须
+  *         由 Motor_BringUp() 重新下发运行参数。
+  *
+  *         不做任何闭环判据。实测电机顶到机械末端会触发电机自身保护并断开
+  *         输出，之后连 0x0420 剩余位移反馈都不再上报，任何"读到变化才动作"
+  *         的判据都会永远等不到。改用定时后靠两件事保证正确：
+  *           ① homeTravel001mm 就是电机实际要走的距离，时间按它算
+  *              （见 homeWaitMsFor），到期时这段行程正好走完；
+  *           ② 这个距离要够从最远端走到头（让电机自己触到保护），
+  *              且正负号对应“向后”；余量也靠这里多填的距离给。
+  *         宁可多等，不能早于到末端就置零。
+  * @param  motorIndex: 下标
+  * @retval 0 已置零，1 该电机不参与归位，-1 有帧发送失败
   */
-void Motor_InitTaskCreate(void)
+int Motor_HomeByRelease(uint8_t motorIndex)
 {
-	osThreadDef(MotorInit, Motor_InitTask, osPriorityNormal, 0, MOTOR_INIT_STACK_SIZE);
-	osThreadCreate(osThread(MotorInit), NULL);
+	int32_t travel;
+	int result = 0;
+
+	if (motorIndex >= MOTOR_MAX_COUNT)
+	{
+		return -1;
+	}
+
+	travel = s_motors[motorIndex].homeTravel001mm;
+	if (travel == 0)
+	{
+		return 1;
+	}
+
+	/* 用归位专用的低速低加速重新配置这一台：小轮径下高速启动的电流峰值
+	   很容易撞上过流保护。 */
+	if (configOneMotor(motorIndex, MOTOR_HOME_SPEED_001MMS,
+	                   MOTOR_HOME_ACCEL_001MMS2) != 0)
+	{
+		return -1;
+	}
+
+	/* 只使能这一台：其它电机保持释放，不会跟着动 */
+	if (Motor_SetEnabled(motorIndex, 1) != 0)
+	{
+		return -1;
+	}
+	osDelay(MOTOR_INIT_FRAME_GAP_MS);
+
+	if (Motor_SetTargetPositionMain(motorIndex, travel, MOTOR_POS_RELATIVE) != 0)
+	{
+		return -1;
+	}
+
+	/* 定时等待：时间按这段行程本身算，不是固定常数——改行程就会改上电耗时。
+	   余量就来自多填的行程：多出的距离 / 速度 = 多等的时间。 */
+	osDelay(homeWaitMsFor(travel));
+
+	/* 清掉未完成的目标。0x0416 相对命令的目标 = 当前位置 + Δ，此时剩余位移
+	   还很大，若直接置零并重新使能，电机会接着往后顶——必须先把目标改成
+	   当前位置（相对 0 位移），它才会停在原地。 */
+	if (Motor_SetTargetPositionMain(motorIndex, 0, MOTOR_POS_RELATIVE) != 0)
+	{
+		result = -1;
+	}
+	osDelay(MOTOR_HOME_SETTLE_MS);
+
+	/* 把这个位置定义成坐标零点。0x0B 只改坐标系，电机不动。
+	   若电机此时仍处于保护释放状态，这一帧可能不被受理——由 Motor_BringUp()
+	   末尾统一使能后的置零步骤兜底。 */
+	if (Motor_SetTargetPositionMain(motorIndex, 0, MOTOR_POS_SET_ZERO) != 0)
+	{
+		result = -1;
+	}
+	osDelay(MOTOR_INIT_FRAME_GAP_MS);
+
+	return result;
 }
 
 /**
-  * @brief  初始化结果。
+  * @brief  完整上电流程，按顺序串行完成：
+  *           ① 等 MOTOR_INIT_SETTLE_MS，让电机完成上电复位；
+  *           ② 逐台（homeTravel001mm 非 0 的）独立走一遍
+  *              Motor_HomeByRelease：初始化 → 使能 → 向后跑到末端 → 置零；
+  *           ③ 重新初始化全部电机（归位用的是低速低加速，必须改回运行参数）；
+  *           ④ 使能全部电机；
+  *           ⑤ 把此刻全部电机的当前位置设为绝对 0。
+  *
+  *         逐台做而不是同时做：同时顶到末端时 CAN 上只有帧 ID 的错误上报
+  *         无法归属，出了问题查不出是哪一台；而且同时大电流更容易触发保护。
+  *         第 ⑤ 步对已置零的那几台是幂等的，对不参与归位的电机则是把当前
+  *         位置直接定为原点，同时兜住"归位阶段因电机仍在保护释放而丢失"的情况。
+  *
+  *         ★ 时间预算 10 s 左右。等待时长由 homeTravel001mm 推算（不是常数）：
+  *             2000（上电稳定）+ Σ(配置 20 + 使能 5 + 等待 + 稳定 200 + 间隔 5)
+  *             + 100（整组重新初始化）+ 25 + 25。
+  *           当前 600 mm 轮径（速度 300000 / 加速度 600000 / 归位速度 150000
+  *           / 归位加速度 60000）下：9 号 -450000 等 4250 ms，11 号 -300000
+  *           等 3250 ms，总计 ≈ 10.1 s。
+  *           改行程 / 速度 / 加速度 / 归位台数都要按这个式子重算。
+  *
+  *         本函数是阻塞的（逐台按行程等待），只能在任务上下文调用。
   * @param  None
-  * @retval 0 成功，-1 至少一帧发送失败，MOTOR_INIT_PENDING 还没跑完
+  * @retval 累计失败帧次数
   */
-int Motor_GetInitResult(void)
+int Motor_BringUp(void)
 {
-	return s_initResult;
-}
-
-/* FreeRTOS tasks -------------------------------------------------------------*/
-
-/**
-  * @brief  初始化任务：等上电稳定后跑一遍 Motor_InitAll()，然后删除自己。
-  *         失败结果留在 s_initResult 里，由 Motor_GetInitResult() 读取。
-  * @param  argument 未使用
-  * @retval None
-  */
-static void Motor_InitTask(void const *argument)
-{
-	(void) argument;
+	uint8_t i;
+	int failures = 0;
 
 	/* 电机上电复位需要时间，早于它发出的 0x0316 会被静默丢弃 */
 	osDelay(MOTOR_INIT_SETTLE_MS);
 
-	s_initResult = Motor_InitAll();
-	vTaskDelete(NULL);
+	for (i = 0; i < MOTOR_COUNT; i++)
+	{
+		if (Motor_HomeByRelease(i) < 0)
+		{
+			failures++;
+		}
+	}
+
+	/* 归位阶段下发的是低速低加速，这里整组改回运行参数 */
+	if (Motor_InitAll() != 0)
+	{
+		failures++;
+	}
+
+	for (i = 0; i < MOTOR_COUNT; i++)
+	{
+		if (Motor_SetEnabled(i, 1) != 0)
+		{
+			failures++;
+		}
+		osDelay(MOTOR_INIT_FRAME_GAP_MS);
+	}
+
+	for (i = 0; i < MOTOR_COUNT; i++)
+	{
+		if (Motor_SetTargetPositionMain(i, 0, MOTOR_POS_SET_ZERO) != 0)
+		{
+			failures++;
+		}
+		osDelay(MOTOR_INIT_FRAME_GAP_MS);
+	}
+
+	return failures;
 }
 
 /**

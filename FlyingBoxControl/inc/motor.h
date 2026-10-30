@@ -54,8 +54,10 @@ extern "C" {
 
 /* 上电后到发出第一条初始化帧之前的等待。电机需要时间完成自身上电复位，
    过早下发 0x0316 会被静默丢弃（该帧无应答，丢了也看不出来）。
+   实测上电后约 1.5 s 内电机一帧都不发，这里取 2000 留余量；再往下压容易
+   踩到未复位的窗口，表现为刚开始就保护释放。
    与 TOF_INIT_SETTLE_MS 相互独立，两个模块各自配置。 */
-#define MOTOR_INIT_SETTLE_MS    3000u
+#define MOTOR_INIT_SETTLE_MS    2000u
 
 /* 初始化帧之间的间隔。CAN_Send() 只阻塞到帧离开邮箱（1 Mbps 下约 0.1 ms），
    而 0x0316 要写参数、0x0408 要写轮径，电机处理跟不上连续帧；帧贴得太紧
@@ -90,6 +92,36 @@ extern "C" {
 #define MOTOR_ERR_OVERTEMP      0x0105  /* 超温 */
 #define MOTOR_ERR_UNDERVOLT     0x0107  /* 欠压 */
 #define MOTOR_ERR_DISCONNECT    0x0108  /* 断线 */
+
+/* ---- 归位（靠电机自保护释放停在末端）----------------------------------*/
+
+/* 归位时临时下发的速度，0.1 mm/s。协议没有“速度模式”，只能发一个大行程
+   相对命令让电机一直往一个方向跑。
+   ★ 单位是轮缘弧长，数值随 wheelDiameter001mm 一起缩放：轮径放大 n 倍，
+     要发出同样的转角就得把这里也放大 n 倍。
+   归位结束后由 Motor_InitAll() 恢复 speed001mms。 */
+#define MOTOR_HOME_SPEED_001MMS 80000u
+
+/* 归位时临时下发的加速度，0.1 mm/s^2，同样随轮径缩放。
+   实测边界（当时轮径 20 mm）：运行加速度 20000 会在加速段就触发过流保护释放，
+   2000 能平稳走完。轮径改大后同样的角加速度对应的数值跟着放大，不能直接沿用
+   旧数字；归位这套值已按 600 mm 轮径换算过。
+   ★ 一出现启动就掉电，先把这里减半，再降 MOTOR_HOME_SPEED_001MMS。 */
+#define MOTOR_HOME_ACCEL_001MMS2 40000u
+
+/* 归位等待时长不是一个宏，而是由 homeTravel001mm / 归位速度 / 归位加速度
+   在运行时算出来（motor.c 的 homeWaitMsFor）：
+     加速段距离 d_acc = v^2 / (2a)，加速段耗时 t_acc = v / a；
+     行程 d <= d_acc：全程都在加速，取 t_acc（上界）；
+     行程 d >  d_acc：t_acc + (d - d_acc) / v。
+   homeTravel001mm 就当成电机实际要走的距离，固件不需要知道任何机械尺寸。
+
+   ★ 余量靠 homeTravel001mm 多填来给：多出的距离 / 速度就是多等的时间，
+     代码不再额加固定余量。所以它也直接决定上电耗时，多填一倍就是多等
+     一倍。改行程 / 速度 / 加速度都会改变上电总时长，要重新核实预算。 */
+
+/* 停下后到置零之间的等待，让电机把剩余速度耗完、位置读数稳定 */
+#define MOTOR_HOME_SETTLE_MS    200u
 
 /**
   * @brief  0x0316 电机参数。按协议表的 Bit 位域拼装，一个字段对应表里的一格。
@@ -136,10 +168,20 @@ typedef struct
 	uint8_t  devId;             /* 设备号，建议 0..15，否则 0x0380+dev 会撞上别的 ID 段 */
 	uint8_t  motorId;           /* 马达号，0..15，同一条总线必须互不相同 */
 	uint8_t  reverse;           /* 0x0316 Byte6 bit7，0=顺时针 1=逆时针（正对电机轴） */
-	uint16_t wheelDiameter001mm;/* 0x0408 轮径，0.01 mm（100 mm -> 10000） */
+	uint16_t wheelDiameter001mm;/* 0x0408 轮径，0.01 mm。字段是 u16，上限 65535 = 655.35 mm，
+	                               超出这个量级的"轮径"不是轮径（大概率是里程）；
+	                               填错不会报错，只会让位移/速度/加速度按同一比例缩放。
+	                               改这个值后，位移/速度/加速度（含 homeTravel001mm）
+	                               必须按同样倍数改，否则实际行程会整体缩放 */
 	uint32_t speed001mms;       /* 0x0415 速度，0.1 mm/s */
 	uint32_t accel001mms2;      /* 0x0414 加速度，0.1 mm/s^2 */
 	MotorConfig params;         /* 0x0316 其余参数字节 */
+	/* 归位用的相对位移，0.1 mm。0 = 这台不需要原点，Motor_BringUp() 跳过。
+	   就把它当成电机实际要走的距离：够从最远端走到头、让电机自己触发保护
+	   释放即可。等待时长同样按它算（见 motor.c 的 homeWaitMsFor），所以也
+	   不该多填。符号表示“朝哪边找”，负值即物理向后。reverse 位会翻转电机
+	   内部正转方向，所以符号要不要跟着 reverse 走必须实测确认。 */
+	int32_t  homeTravel001mm;
 
 	/* ---- 状态区 ---- */
 	/* 0x0420 + motorId：到目标点的剩余位移，减到 0 即到位，不是绝对位置 */
@@ -171,23 +213,29 @@ typedef struct
    必须在 CAN_Init() 之后、CAN_RxTaskCreate() 之前调用。 */
 void Motor_Init(void);
 
-/* 按下标初始化全部电机，每台按 MotorInfo 里的配置依次发：
-  0x0316 参数 → 0x0408 轮径（×3）→ 0x0414 加速度 → 0x0415 速度 → 0x0413 使能。
-   每帧之间插 MOTOR_INIT_FRAME_GAP_MS，只能在调度器启动后的任务上下文调用；
-   在 main 里请改用 Motor_InitTaskCreate()。
-   返回 0 表示所有帧都已发出，-1 表示至少一帧发送失败。 */
+/* 按下标配置全部电机，每台按 MotorInfo 里的配置依次发：
+  0x0316 参数 → 0x0408 轮径（×3）→ 0x0414 加速度 → 0x0415 速度。
+  ★ 不发使能帧（0x0413）：使能由 Motor_BringUp() 在合适的时机统一发。
+  每帧之间插 MOTOR_INIT_FRAME_GAP_MS，会 osDelay，只能在任务上下文调用。
+  返回 0 表示所有帧都已发出，-1 表示至少一帧发送失败。 */
 int Motor_InitAll(void);
 
-/* Motor_InitAll() 还没跑完时的返回值 */
-#define MOTOR_INIT_PENDING      (-2)
+/* 完整上电流程，从头到尾串行跑完（总时长十几到几十秒）：
+    ① 等 MOTOR_INIT_SETTLE_MS，让电机完成上电复位；
+    ② 逐台（homeTravel001mm 非 0 的）单独初始化 → 使能 → 向后跑长行程 →
+       按行程推算的时间定时等待 → 清除残留目标 → 把停住的位置置零；
+    ③ 重新初始化全部电机（归位时用的是低速低加速，必须改回运行参数）；
+    ④ 使能全部电机；
+    ⑤ 把此刻全部电机的当前位置设为绝对 0。
 
-/* 创建一次性初始化任务：调度器启动后执行 Motor_InitAll()，完成后自删。
-   与 CAN_RxTaskCreate() 同时使用，且必须在其之后创建，
-   这样接收任务会先挂到队列上，配置期间的 ACK 不会堆积。 */
-void Motor_InitTaskCreate(void);
+  为什么每台归位前都要重新初始化：电机顶到末端触发保护释放后，内部的
+  参数与输出级状态已不可信，必须重新下发 0x0316/0x0408 才能正常驱动。
+  为什么最后还要整组再初始化一遍：归位阶段下发的是低速低加速，直接拿来
+  跑正常运动会很慢；而且归位期间被保护过的电机需要重新使能。
 
-/* 初始化结果：0 成功，-1 至少一帧发送失败，MOTOR_INIT_PENDING 还没跑完。 */
-int Motor_GetInitResult(void);
+  会大量 osDelay，只能在调度器启动后的任务上下文中调用。
+  返回累计失败帧次数。 */
+int Motor_BringUp(void);
 
 /* 指定下标对应的两个地址，用于覆盖 Motor_Init() 按 MOTOR_DEV_BASE 给出的默认值。 */
 void Motor_SetAddress(uint8_t motorIndex, uint8_t devId, uint8_t motorId);
@@ -256,6 +304,24 @@ int Motor_QueryTemperature(uint8_t motorIndex);
 int Motor_QueryPosition(uint8_t motorIndex);
 int Motor_QueryStatus(uint8_t motorIndex);
 int Motor_QueryFirmware(uint8_t motorIndex);
+
+/* ---- 归位（靠电机自保护释放停在末端）----------------------------------
+   用法：直接调 Motor_BringUp()，它已经把"逐台归位 → 全部初始化 → 全部使能
+   → 全部置零"串成一条完整流程。单台的 Motor_HomeByRelease() 一般不用直接调。
+   两者都会 osDelay，只能在调度器启动后的任务上下文中调用。            */
+
+/* 单台归位：初始化这一台（参数/轮径/归位用的速度与加速度）→ 使能 →
+   按 homeTravel001mm 发一段相对位移 → 按同一段距离推算出的时间定时等待
+   （电机顶到末端后自身保护会断开输出）→ 清除残留目标 → 把停住的位置定义成 0。
+   不做任何闭环判据：实测保护动作后连剩余位移反馈都不再上报，读不到变化。
+   homeTravel001mm 为 0 时立即返回 1（该电机不参与归位）。
+   ★ homeTravel001mm 就是电机实际走的距离：太短会行程走完还没到末端，把半途
+     当原点；太长则只是白等（时间也按它算）。填到"从最远端一定走得到头"即可。
+   ★ 只使能这一台，其它电机保持释放，不会跟着动。
+   ★ 返回后该台用的是归位参数（低速低加速），要跑正常运动必须重新
+     Motor_InitAll()。
+   返回 0 已置零，1 跳过，-1 有帧发送失败。 */
+int Motor_HomeByRelease(uint8_t motorIndex);
 
 /* 0x060D 获取设备 SN。实测这颗固件对本查询无应答，SN 只能靠上电瞬间的 0x0312
    抓取（该帧不带地址，未做解析）。 */
