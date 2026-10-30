@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 
@@ -293,5 +294,151 @@ internal static class CanDecoder
         }
 
         return builder.ToString();
+    }
+}
+
+/// <summary>一条待发的命令：帧 ID、载荷、给人看的名字。</summary>
+internal readonly record struct OutFrame(uint Id, byte[] Data, string Note);
+
+/// <summary>
+/// 按固件 motor.c 的发送函数拼装请求帧，供上位机主动下发。
+/// 与 CanDecoder 共用同一套帧定义：一个解、一个拼。
+///
+/// ★ 这里的默认参数（轮径 / 速度 / 加速度 / 方向位）抄自固件
+///   s_defaultMotors 与 MOTOR_PARAMS_DEFAULT。固件改了而这里没跟着改时，
+///   本面板下发的内容就会与固件不一致——方向位不一致会让电机朝反方向走。
+/// </summary>
+internal static class CanCommand
+{
+    /* 帧 ID，与固件 motor.c 的 MOTOR_ID_* 一致 */
+    private const uint IdParam = 0x0316;
+    private const uint IdMulti = 0x0408;
+    private const uint IdEnable = 0x0413;
+    private const uint IdAccelMain = 0x0414;
+    private const uint IdSpeedMain = 0x0415;
+    private const uint IdPositionMain = 0x0416;
+
+    /* 子功能与命令字，与固件 motor.c 的宏一致 */
+    private const byte SubWheel = 0x24;
+    private const byte CmdEnable = 0x5A;
+    private const byte PosRelative = 0x00;
+
+    /* 0x0316 前 6 字节取自固件 MOTOR_PARAMS_DEFAULT，本面板不改这些参数，
+       原样回填以保证“初始化”不会把固件调好的参数冲掉 */
+    private const byte Param0 = 0xB4;
+    private const byte Param1 = 0xBF;
+    private const byte Param2 = 0xCF;
+    private const byte Param3 = 0xAA;
+    private const byte Param4 = 0x00;
+    private const byte Param5 = 0x5F;
+
+    /* 固件 s_defaultMotors 里五台共用的运行参数 */
+    private const ushort Wheel001mm = 60000;
+    private const uint RunSpeed001mms = 80000;
+    private const uint RunAccel001mms2 = 40000;
+
+    private const byte MotorIdBase = 7;
+
+    /// <summary>
+    /// 该马达号在固件里的方向反转位。界面据此预置复选框：
+    /// 显示出来比藏在代码里安全，方向位弄错电机会朝反方向走。
+    /// </summary>
+    public static bool DefaultReverse(byte motorId)
+    {
+        /* 固件 s_defaultMotors：下标 1/2/4（设备号 8/9/11）安装方向相反 */
+        return motorId is 8 or 9 or 11;
+    }
+
+    /// <summary>把一个 0~4 的下标换算成马达号；默认寻址下设备号与马达号相同。</summary>
+    public static byte MotorIdOf(int index)
+    {
+        return (byte)(MotorIdBase + index);
+    }
+
+    /// <summary>
+    /// 拼出“初始化 + 使能 + 相对位移”的完整序列，顺序与固件
+    /// configOneMotor() + Motor_SetEnabled() + Motor_SetTargetPositionMain() 一致：
+    /// 参数 → 轮径（协议要求连写三次）→ 加速度 → 速度 → 使能 → 位移。
+    ///
+    /// 轮径必须在下发运动命令之前写好，实测不配轮径运动指令不会执行；
+    /// 速度与加速度只在本条运动命令之前生效，所以它们必须排在位移之前。
+    /// </summary>
+    /// <param name="motorId">马达号，同时用作默认寻址下的设备号</param>
+    /// <param name="pos001mm">相对位移，0.1 mm，符号决定方向</param>
+    /// <param name="reverse">0x0316 的方向反转位</param>
+    public static List<OutFrame> InitAndMove(byte motorId, int pos001mm, bool reverse)
+    {
+        byte[] wheel = Wheel(motorId, Wheel001mm);
+
+        return new List<OutFrame>
+        {
+            new(IdParam, Param(motorId, reverse), "参数"),
+            new(IdMulti, wheel, "轮径 1/3"),
+            new(IdMulti, (byte[])wheel.Clone(), "轮径 2/3"),
+            new(IdMulti, (byte[])wheel.Clone(), "轮径 3/3"),
+            new(IdAccelMain, U32WithMotorId(RunAccel001mms2, motorId), "加速度"),
+            new(IdSpeedMain, U32WithMotorId(RunSpeed001mms, motorId), "速度"),
+            new(IdEnable, Enable(motorId), "使能"),
+            new(IdPositionMain, MoveRelative(pos001mm, motorId), "相对位移"),
+        };
+    }
+
+    /// <summary>0x0316：整组参数 + 马达号 + 设备号。本面板只改方向位，其余原样回填。</summary>
+    private static byte[] Param(byte motorId, bool reverse)
+    {
+        return new[]
+        {
+            Param0, Param1, Param2, Param3, Param4, Param5,
+            /* bit5/bit4 保持 0：这两个位会关掉周期反馈，留着 0 才有 0x0420/0x0440 */
+            (byte)((reverse ? 0x80 : 0x00) | (motorId & 0x0F)),
+            motorId,
+        };
+    }
+
+    /// <summary>0x0408 子功能 0x24：轮径，设备号 + 子功能 + u16 LE（0.01 mm）。</summary>
+    private static byte[] Wheel(byte devId, ushort wheel001mm)
+    {
+        return new[]
+        {
+            devId,
+            SubWheel,
+            (byte)(wheel001mm & 0xFF),
+            (byte)(wheel001mm >> 8),
+        };
+    }
+
+    /// <summary>0x0413：使能。第 5 字节是马达号，不是设备号。</summary>
+    private static byte[] Enable(byte motorId)
+    {
+        return new[] { CmdEnable, (byte)0x00, (byte)0x00, (byte)0x00, motorId };
+    }
+
+    /// <summary>0x0416：目标位置 s32 LE + 马达号 + 目标类型。</summary>
+    private static byte[] MoveRelative(int pos001mm, byte motorId)
+    {
+        uint raw = unchecked((uint)pos001mm);
+
+        return new[]
+        {
+            (byte)(raw & 0xFF),
+            (byte)((raw >> 8) & 0xFF),
+            (byte)((raw >> 16) & 0xFF),
+            (byte)((raw >> 24) & 0xFF),
+            motorId,
+            PosRelative,
+        };
+    }
+
+    /// <summary>0x0414 / 0x0415 共用：u32 LE + 马达号。</summary>
+    private static byte[] U32WithMotorId(uint value, byte motorId)
+    {
+        return new[]
+        {
+            (byte)(value & 0xFF),
+            (byte)((value >> 8) & 0xFF),
+            (byte)((value >> 16) & 0xFF),
+            (byte)((value >> 24) & 0xFF),
+            motorId,
+        };
     }
 }

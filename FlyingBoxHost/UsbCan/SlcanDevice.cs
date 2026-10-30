@@ -24,7 +24,7 @@ internal readonly record struct RawFrame(long TickMs, uint Id, byte[] Data);
 /// 因此打开时一律发 O；且通道可能因上一次会话的 C 处于关闭状态，
 /// 所以发完 O 要确认真的有字节进来，没进来就重发。
 ///
-/// 只做被动接收：除设置波特率与打开通道外，不发任何数据帧。
+/// 只做被动接收：除设置波特率、打开通道以及主动下发的控制帧外，不发其它数据帧。
 /// </summary>
 internal sealed class SlcanDevice : IDisposable
 {
@@ -244,6 +244,52 @@ internal sealed class SlcanDevice : IDisposable
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// 发一帧标准数据帧（11 位标识符）。SLCAN 文本格式为
+    /// t 加 3 位十六进制标识符、1 位十六进制长度、随后每字节 2 位十六进制。
+    ///
+    /// 这里只写、不读：读端口留给接收线程，否则会把帧从接收流里吃掉。
+    /// 返回 wire 为实际写出的文本，便于在界面上核对字节。
+    /// </summary>
+    /// <param name="id">11 位标准标识符</param>
+    /// <param name="data">载荷，最多 8 字节</param>
+    /// <param name="wire">实际写出的 SLCAN 文本</param>
+    /// <returns>写成功返回 true</returns>
+    public bool SendFrame(uint id, byte[] data, out string wire)
+    {
+        wire = "";
+
+        if (!IsOpen)
+        {
+            wire = "设备未打开";
+            return false;
+        }
+
+        if (id > 0x7FFu)
+        {
+            wire = "标识符超出 11 位范围";
+            return false;
+        }
+
+        if ((data.Length < 1) || (data.Length > 8))
+        {
+            wire = "载荷长度必须在 1~8 之间，当前 " + data.Length;
+            return false;
+        }
+
+        StringBuilder line = new("t");
+        line.Append(id.ToString("X3", CultureInfo.InvariantCulture));
+        line.Append(data.Length.ToString("X1", CultureInfo.InvariantCulture));
+        foreach (byte b in data)
+        {
+            line.Append(b.ToString("X2", CultureInfo.InvariantCulture));
+        }
+
+        line.Append('\r');
+        wire = line.ToString().TrimEnd('\r');
+        return WriteRaw(line.ToString());
     }
 
     private bool WriteRaw(string text)

@@ -71,6 +71,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
@@ -124,8 +125,33 @@
             </ItemsControl>
         </GroupBox>
 
+        <!-- 电机控制：由上位机直接下发命令，不经过固件 -->
+        <GroupBox Grid.Row="4" Header="电机控制（上位机下发）" Padding="4" Margin="0,0,0,6">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="马达号" VerticalAlignment="Center"/>
+                <ComboBox x:Name="MotorIndexBox" Width="64" Height="24" Margin="6,0,0,0"
+                          SelectedIndex="0" SelectionChanged="MotorIndexBox_SelectionChanged">
+                    <ComboBoxItem Content="7"/>
+                    <ComboBoxItem Content="8"/>
+                    <ComboBoxItem Content="9"/>
+                    <ComboBoxItem Content="10"/>
+                    <ComboBoxItem Content="11"/>
+                </ComboBox>
+                <TextBlock Text="位移 mm" VerticalAlignment="Center" Margin="14,0,4,0"/>
+                <TextBox x:Name="MoveDistanceBox" Width="90" Height="24" Text="10"
+                         VerticalContentAlignment="Center"
+                         ToolTip="正负表示方向。内部乘 10 换成协议的 0.1 mm 单位"/>
+                <CheckBox x:Name="ReverseBox" Content="方向反转" VerticalAlignment="Center" Margin="14,0,0,0"
+                          ToolTip="对应 0x0316 的 bit7。必须与固件 s_defaultMotors 的 reverse 一致，否则电机会朝反方向走"/>
+                <Button x:Name="InitMoveButton" Content="初始化并位移" Width="110" Height="26"
+                        Margin="14,0,0,0" Click="InitMoveButton_Click"/>
+                <TextBlock x:Name="CommandText" VerticalAlignment="Center" Margin="12,0,0,0"
+                           Foreground="#555" Text="未下发过命令"/>
+            </StackPanel>
+        </GroupBox>
+
         <!-- 原始报文 -->
-        <GroupBox Grid.Row="4" Header="原始报文（最近 200 条）" Padding="4">
+        <GroupBox Grid.Row="5" Header="原始报文（最近 200 条）" Padding="4">
             <DataGrid x:Name="FrameGrid" AutoGenerateColumns="False"
                       IsReadOnly="True" CanUserAddRows="False" EnableRowVirtualization="True"
                       HeadersVisibility="Column" GridLinesVisibility="Horizontal"
@@ -141,7 +167,7 @@
             </DataGrid>
         </GroupBox>
 
-        <StatusBar Grid.Row="5">
+        <StatusBar Grid.Row="6">
             <StatusBarItem>
                 <TextBlock x:Name="StatusText" Text="就绪"/>
             </StatusBarItem>

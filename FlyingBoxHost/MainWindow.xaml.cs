@@ -4,7 +4,9 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Threading;
 using FlyingBoxHost.Protocol;
 using FlyingBoxHost.UsbCan;
@@ -36,6 +38,9 @@ namespace FlyingBoxHost
         /* 连续这么久没收到任何字节，就认为通道哑了，自动重发 O */
         private const int RecoverIdleMs = 1500;
 
+        /* 与固件 MOTOR_INIT_FRAME_GAP_MS 一致：电机侧需要帧间间隔，连续灌会丢帧 */
+        private const int CommandFrameGapMs = 5;
+
         private readonly SlcanDevice device = new();
         private readonly DeviceTracker tracker = new();
         private readonly List<FrameRow> rows = new();
@@ -63,6 +68,7 @@ namespace FlyingBoxHost
         {
             RefreshPorts();
             DeviceInfoText.Text = "选择端口后点“打开设备”。设备为 CANable2（CDC 串口）。";
+            SyncReverseBox();
         }
 
         private void Window_Closed(object? sender, EventArgs e)
@@ -177,6 +183,86 @@ namespace FlyingBoxHost
 
             File.WriteAllText(dialog.FileName, builder.ToString(), Encoding.UTF8);
             StatusText.Text = "已导出 " + rows.Count + " 行 → " + dialog.FileName;
+        }
+
+        private void MotorIndexBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            SyncReverseBox();
+        }
+
+        /// <summary>
+        /// 把方向反转框预置成固件里对应马达号的取值。构造期控件还没建好，
+        /// 事件会先于赋值触发，所以这里允许空。
+        /// </summary>
+        private void SyncReverseBox()
+        {
+            if ((MotorIndexBox == null) || (ReverseBox == null))
+            {
+                return;
+            }
+
+            byte motorId = CanCommand.MotorIdOf(MotorIndexBox.SelectedIndex);
+            ReverseBox.IsChecked = CanCommand.DefaultReverse(motorId);
+        }
+
+        /// <summary>
+        /// 对选中的电机下发“初始化 + 使能 + 相对位移”。
+        ///
+        /// 帧序列在 CanCommand.InitAndMove() 里拼装，本方法只负责取输入、
+        /// 按固件的帧间隔逐帧写出，并把实际写出的报文回显到界面。
+        /// 输入取 mm，内部乘 10 换成协议的 0.1 mm；正负号表示方向。
+        /// </summary>
+        private async void InitMoveButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (!device.IsOpen)
+            {
+                CommandText.Text = "设备未打开";
+                return;
+            }
+
+            if (!double.TryParse(MoveDistanceBox.Text, NumberStyles.Float,
+                                 CultureInfo.InvariantCulture, out double distanceMm))
+            {
+                CommandText.Text = "位移不是合法数字";
+                return;
+            }
+
+            /* 界面收 mm，协议要 0.1 mm；四舍五入避免输入 0.05 变成 0 */
+            int pos001mm = (int)Math.Round(distanceMm * 10.0, MidpointRounding.AwayFromZero);
+            if (pos001mm == 0)
+            {
+                CommandText.Text = "位移算出 0，电机会原地不动";
+                return;
+            }
+
+            byte motorId = CanCommand.MotorIdOf(MotorIndexBox.SelectedIndex);
+            bool reverse = ReverseBox.IsChecked == true;
+            List<OutFrame> plan = CanCommand.InitAndMove(motorId, pos001mm, reverse);
+
+            InitMoveButton.IsEnabled = false;
+            try
+            {
+                for (int i = 0; i < plan.Count; i++)
+                {
+                    OutFrame frame = plan[i];
+                    if (!device.SendFrame(frame.Id, frame.Data, out string wire))
+                    {
+                        CommandText.Text = "第 " + (i + 1) + " 帧（" + frame.Note + "）发送失败：" + wire;
+                        return;
+                    }
+
+                    CommandText.Text = "已发 " + (i + 1) + "/" + plan.Count + " " + frame.Note + "：" + wire;
+                    await Task.Delay(CommandFrameGapMs);
+                }
+
+                CommandText.Text = "马达号 " + motorId + " 已下发：相对位移 " +
+                                   distanceMm.ToString("0.0", CultureInfo.InvariantCulture) + " mm" +
+                                   (reverse ? "（反转）" : "");
+            }
+            finally
+            {
+                InitMoveButton.IsEnabled = true;
+            }
         }
 
         private void Tick(object? sender, EventArgs e)

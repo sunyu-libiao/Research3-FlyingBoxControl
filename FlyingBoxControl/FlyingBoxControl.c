@@ -94,16 +94,23 @@ static int SystemClock_Config(void)
 /**
   * @brief  让一台电机持续运动，直到 TOF 测得的距离满足条件时停住。
   *
-  *         协议里没有“停止”指令，也没有速度模式，所以做法是：先压低接近速度，
-  *         再发一段足够长的相对位移让它自己跑，条件满足后把目标改成“当前位置”
+  *         协议里没有“停止”指令，也没有速度模式，所以做法是：先发一段
+  *         足够长的相对位移让它自己跑，条件满足后把目标改成“当前位置”
   *         （相对 0）令其减速停车。
   *
-  *         为什么必须由调用方压低接近速度：停车是减速过程，还会继续走
-  *         v^2/(2a)；用运行速度接近会直接冲过阈值，根本没机会停。
+  *         判据只看两件事：最近一帧读数 valid，且它确实是一帧新的（seq 变化）。
+  *         只看 distance 会被两种情况骗过：无效读数下 distance 是 0（看起来
+  *         “距离已很小”），以及同一帧被反复读到。
   *
-  *         判据要求连续多个**新样本**都满足才停，且必须 valid。只看 distance
-  *         会被两种情况骗过：无效读数下 distance 是 0（看起来“距离已很小”），
-  *         以及轮询快于模块测量时反复读到的同一个值。
+  *         ★ 不要在这里加“样本不超过 N ms 才算数”这类新鲜度窗口：上报周期由
+  *           模块自己掌控，且会变；窗口比实际周期短时判据永远不过，表现就是
+  *           距离早就够了却一直不停。新鲜度不是停车判据应该关心的事。
+  *
+  *         不要求连续多帧满足：上报周期不确定，要求几帧就至少多等几个周期，
+  *         速度快时可能整段错过窗口，而漏停的代价是撞机。
+  *
+  *         反向失效保护：曾经看到过读数、之后又连续看不到，就当作目标已经
+  *         不可见（例如已经近过模块量程下限），立即停车。一直盲走只会更近。
   *
   *         无论怎么退出都会发出停车命令。返回后这台电机内部的速度是 speed，
   *         结构体里的 speed001mms 并未改变，要恢复运行参数得重新 Motor_InitAll()。
@@ -114,25 +121,28 @@ static int SystemClock_Config(void)
   * @param  decreasing: 1 = 距离缩到阈值以下时停（正在接近目标），0 = 反之
   * @param  speed: 接近速度，0.1 mm/s
   * @param  timeoutMs: 最长等待时间，ms
-  * @retval 0 条件满足已停，-1 超时，-2 TOF 无有效数据，-3 参数或发帧错误
+  * @retval 0 条件满足已停，-1 超时，-2 始终无有效数据，-3 参数或发帧错误，
+  *         -4 读数丢失（曾有过、后来没了）
   */
 static int MoveUntilTof(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
                         uint16_t stopDistance, uint8_t decreasing,
                         uint32_t speed, uint32_t timeoutMs)
 {
-	/* 样本陈旧阈值：超时没新帧就当数据不可用，避免冻结值一直满足条件 */
 	enum
 	{
-		SAMPLE_STALE_MS = 500,
 		POLL_MS = 10,
-		NEED_HITS = 3
+		/* 曾经看到过有效读数、之后又断了这么久，就当目标已不可见，停车。
+		   取“多久算断”而不是“多久算新”：断流持续存在时，只有这种方向
+		   的判据能保证机构最终会停下来。 */
+		SAMPLE_LOST_MS = 2000
 	};
 
 	const TofInfo *tof;
 	uint32_t elapsed = 0;
+	uint32_t lastSampleTick = 0;
 	uint8_t lastSeq = 0;
 	uint8_t haveSeq = 0;
-	uint8_t hits = 0;
+	uint8_t seen = 0;
 	int result = -1;
 
 	if ((motorIndex >= MOTOR_MAX_COUNT) || (tofIndex >= TOF_COUNT))
@@ -159,9 +169,12 @@ static int MoveUntilTof(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
 
 	while (elapsed < timeoutMs)
 	{
-		if ((tof->valid != 0) &&
-		    ((HAL_GetTick() - tof->lastRxTick) < SAMPLE_STALE_MS))
+		if (tof->valid != 0)
 		{
+			seen = 1;
+			lastSampleTick = HAL_GetTick();
+
+			/* 同一帧只判一次：seq 不变说明模块还没测出新值 */
 			if ((haveSeq == 0) || (tof->seq != lastSeq))
 			{
 				uint8_t reached;
@@ -180,25 +193,23 @@ static int MoveUntilTof(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
 
 				if (reached != 0)
 				{
-					hits++;
-					if (hits >= NEED_HITS)
-					{
-						result = 0;
-						break;
-					}
-				}
-				else
-				{
-					hits = 0;
+					result = 0;
+					break;
 				}
 			}
+		}
+		else if ((seen != 0) &&
+		         ((HAL_GetTick() - lastSampleTick) >= SAMPLE_LOST_MS))
+		{
+			result = -4;
+			break;
 		}
 
 		osDelay(POLL_MS);
 		elapsed += POLL_MS;
 	}
 
-	/* 区分“一直没数据”和“有数据但没满足条件” */
+	/* 区分“始终没数据”和“有数据但没满足条件” */
 	if ((result != 0) && (haveSeq == 0))
 	{
 		result = -2;
@@ -237,8 +248,7 @@ static void MotorControl_Task(void const *argument)
 	(void)Motor_WaitArrive(3, 5000);
 
 	/* 测试：9 号（下标 2）持续前进，直到 25 号 TOF（下标 0）测得的距离缩到阈值。
-	   前进时距离变小，所以 decreasing 传 1；方向反了就把 travel 的符号翻掉。
-	   接近速度刻意压低：停车还要减速走一段，速度越高冲过阈值越多。 */
+	   前进时距离变小，所以 decreasing 传 1；方向反了就把 travel 的符号翻掉。 */
 	(void)MoveUntilTof(2, 0, 1000000, 3000, 1, 25000, 30000);
 
 	for (;;)
