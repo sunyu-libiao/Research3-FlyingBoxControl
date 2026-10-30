@@ -81,7 +81,7 @@
    ★ 速度不能跟着运行参数一起翻倍。停车是减速过程，刹距约 v^2/(2a)，
      加速度不变时速度翻倍就是四倍刹距；刹距一旦超过 BELT_APPROACH_DISTANCE，
      必然冲过目标点。要提速得先加大加速度或放宽阈值。 */
-#define BELT_APPROACH_DISTANCE     600u         /* 停车距离阈值，0.1 mm；小于它即停 */
+#define BELT_APPROACH_DISTANCE     700u         /* 停车距离阈值，0.1 mm；小于它即停 */
 #define BELT_APPROACH_TRAVEL       (-10000)     /* 负值 = 物理向后，与 homeTravel001mm 的符号惯例一致 */
 #define BELT_APPROACH_SPEED        800u
 #define BELT_APPROACH_TIMEOUT_MS   30000u
@@ -139,7 +139,7 @@
 
 /* 9 号第二段的绝对目标，协议单位 0.1 mm。就是电机自己的坐标，
    与真实物理距离只差在标定，不代表它一定是某个整数的毫米量。 */
-#define AXIS_FORWARD_TARGET        5000
+#define AXIS_FORWARD_TARGET        4800
 
 /* Private macro -------------------------------------------------------------*/
 /* Private variables ---------------------------------------------------------*/
@@ -150,6 +150,10 @@ static volatile int8_t s_lastSeekResult = MOTOR_RETURN_SKIPPED;
 /* 9 号第二段（按读数定位到箱子前）的结果：0 = 已到位，-1 始终没有有效读数，
    -2 发帧失败，-3 等到位超时；MOTOR_RETURN_SKIPPED = 盲走段没成功，没执行。 */
 static volatile int8_t s_lastMoveResult = MOTOR_RETURN_SKIPPED;
+
+/* 装置转回正前方之后，9 号按 25 号 TOF 读数再接近一次的结果，取值同上；
+   MOTOR_RETURN_SKIPPED = 前面某步失败没执行。 */
+static volatile int8_t s_lastApproachResult = MOTOR_RETURN_SKIPPED;
 
 /* 紧接着的「主轴回原点 + 皮带跟随」的结果：MOTOR_RETURN_SKIPPED = 没执行，
    0 = 三台都已到位，其它负值见 ReturnAxisToOrigin() 的返回码。 */
@@ -793,8 +797,10 @@ static int MoveAxisAbsoluteWithBelts(uint8_t motorIndex, uint8_t beltIndexA, uin
   *         停 MOTOR_SEQ_PAUSE_MS → 7/8 号向前退回，直到距离超过
   *         BELT_FORWARD_DISTANCE →
   *         10 号转回正前方工位 →
+  *         9 号按 25 号 TOF 读数再前进到箱子前 →
+  *         11 号绝对定位到爪端工位 →
   *         9 号绝对定位到 AXIS_FORWARD_TARGET，7/8 号同向同距跟随 →
-  *         9 号单独回绝对 0。
+  *         11 号先收回到近端工位，再让 9 号单独回绝对 0。
   *         整个流程是阻塞的（逐台等归位延时与到位），期间本任务一直占着。
   *         不重试：失败只计数，由上层检查机械与参数。
   * @param  argument 未使用
@@ -902,6 +908,19 @@ static void MotorControl_Task(void const *argument)
 		(void)Motor_SetTargetPositionMain(3, 75000, MOTOR_POS_ABSOLUTE);
 		(void)Motor_WaitArrive(3, 10000);
 
+		/* 装置转回正前方之后，再按 25 号 TOF（下标 0）的读数把 9 号送到箱子前。
+		   和第一次接近同一套做法：读数决定行程，末端由电机自己减速停住，
+		   所以起点坐标与上一次不同也不影响落点间距。 */
+		s_lastApproachResult = (int8_t)MoveForwardByTof(2, 0, AXIS_APPROACH_MARGIN,
+		                                                AXIS_APPROACH_SPEED);
+
+		if (s_lastApproachResult == 0)
+		{
+			/* 11 号（下标 4）绝对定位到 100000 */
+			(void)Motor_SetTargetPositionMain(4, 100000, MOTOR_POS_ABSOLUTE);
+			(void)Motor_WaitArrive(4, 5000);
+		}
+
 		/* 9 号（下标 2）绝对定位到 AXIS_FORWARD_TARGET，7/8 号同向同距跟随；
 		   到位判据只看 9 号的剩余位移。 */
 		s_lastAxisForwardResult = (int8_t)MoveAxisAbsoluteWithBelts(2, 0, 1,
@@ -910,9 +929,18 @@ static void MotorControl_Task(void const *argument)
 
 		if (s_lastAxisForwardResult == 0)
 		{
-			/* 最后 9 号单独回绝对 0，7/8 号不动 */
-			(void)Motor_SetTargetPositionMain(2, 0, MOTOR_POS_ABSOLUTE);
-			s_lastAxisZeroResult = (int8_t)Motor_WaitArrive(2, MOTOR_RETURN_TIMEOUT_MS);
+			/* ★ 9 号后退之前必须先把 11 号的手臂收回来：钩子还插在箱子上时
+			   让 9 号退，会把箱子一起拖回去，或者直接钩住。
+			   所以这里串行等 11 号到位，到位了才启动 9 号；收不回来就不退，
+			   留在原地等上层处理，不带箱子跑。 */
+			(void)Motor_SetTargetPositionMain(4, 10000, MOTOR_POS_ABSOLUTE);
+
+			if (Motor_WaitArrive(4, 5000) == 0)
+			{
+				/* 最后 9 号单独回绝对 0，7/8 号不动 */
+				(void)Motor_SetTargetPositionMain(2, 0, MOTOR_POS_ABSOLUTE);
+				s_lastAxisZeroResult = (int8_t)Motor_WaitArrive(2, MOTOR_RETURN_TIMEOUT_MS);
+			}
 		}
 	}
 
