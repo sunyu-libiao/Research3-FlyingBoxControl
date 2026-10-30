@@ -99,27 +99,32 @@ static uint32_t s_errorFrameCount;
 
 static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 {
-	/* 下标 0 / 设备号 7，无绝对位置需求 */
+	/* 下标 0 / 设备号 7，控制一根皮带滑动，与 9 号同在一条水平轴上，
+	   无绝对位置需求。轮径不是机械直径：按皮带实测行程反算出的
+	   "电机每转对应的皮带行程"。
+	   速度与加速度跟 9 号取同一个值：协议这两个字段是轮缘弧长量，轮径
+	   已经标定成真实行程，所以相同数值就是相同的物理速度，与轮径大小无关。 */
 	{
 		.reverse = 0,
-		.wheelDiameter001mm = 60000u,
-		.speed001mms = 160000u,
-		.accel001mms2 = 80000u,
+		.wheelDiameter001mm = 3180u,
+		.speed001mms = 1600u,
+		.accel001mms2 = 800u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = 0,
-		.homeSpeed001mms = MOTOR_HOME_SPEED_001MMS,
-		.homeAccel001mms2 = MOTOR_HOME_ACCEL_001MMS2
+		.homeSpeed001mms = 1600u,
+		.homeAccel001mms2 = 800u
 	},
-	/* 下标 1 / 设备号 8，安装方向相反，无绝对位置需求 */
+	/* 下标 1 / 设备号 8，控制另一根皮带滑动，安装方向相反，与 9 号同在
+	   一条水平轴上，无绝对位置需求。标定与下标 0 相同（同一套传动）。 */
 	{
 		.reverse = 1,
-		.wheelDiameter001mm = 60000u,
-		.speed001mms = 160000u,
-		.accel001mms2 = 80000u,
+		.wheelDiameter001mm = 3180u,
+		.speed001mms = 1600u,
+		.accel001mms2 = 800u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = 0,
-		.homeSpeed001mms = MOTOR_HOME_SPEED_001MMS,
-		.homeAccel001mms2 = MOTOR_HOME_ACCEL_001MMS2
+		.homeSpeed001mms = 1600u,
+		.homeAccel001mms2 = 800u
 	},
 	/* 下标 2 / 设备号 9，安装方向相反，向后找末端。
 	   这个值就是命令电机走的距离，要够从最远端走到头；等待时长也按它算，

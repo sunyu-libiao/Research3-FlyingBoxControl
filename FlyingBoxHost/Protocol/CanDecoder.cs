@@ -333,12 +333,14 @@ internal static class CanCommand
     private const byte Param5 = 0x5F;
 
     /* 固件 s_defaultMotors 里五台的运动参数。逐台查表而不是共用一个常量：
-       9 号的轮径是按实测行程反算的，轮缘弧长量（位移/速度/加速度）也
-       跟着同量级缩放；若统一按默认值下发，本面板的“初始化”会把固件
-       配好的参数冲掉，之后所有位移与速度又变成错误的比例。 */
-    private const ushort DefaultWheel001mm = 60000;
-    private const uint DefaultSpeed001mms = 80000;
-    private const uint DefaultAccel001mms2 = 40000;
+       7/8/9 的轮径都是按实测行程反算的，7/8 控制皮带、9 控制直线机构，
+       三者的“每转行程”与 10/11 差着量级；速度与加速度也必须与轮径同量级。
+       若统一按一个默认值下发，本面板的“初始化”会把固件配好的参数冲掉，
+       之后所有位移与速度又变成错误的比例。
+       ★ 固件改 s_defaultMotors 时必须同步这里，否则两边不一致。 */
+    private const ushort UncalWheel001mm = 60000;
+    private const uint UncalSpeed001mms = 160000;
+    private const uint UncalAccel001mms2 = 80000;
 
     private const byte MotorIdBase = 7;
 
@@ -355,11 +357,16 @@ internal static class CanCommand
     {
         return motorId switch
         {
-            /* 固件 s_defaultMotors[1]/[2]/[4]：安装方向相反；9 号单独标定过 */
-            8 => new MotorDefaults(DefaultWheel001mm, DefaultSpeed001mms, DefaultAccel001mms2, true),
-            9 => new MotorDefaults(622, 829, 415, true),
-            11 => new MotorDefaults(DefaultWheel001mm, DefaultSpeed001mms, DefaultAccel001mms2, true),
-            _ => new MotorDefaults(DefaultWheel001mm, DefaultSpeed001mms, DefaultAccel001mms2, false),
+            /* 下标 0：7 号，皮带，轮径按实测 1000mm→53mm 反算 */
+            7 => new MotorDefaults(3180, 1600, 800, false),
+            /* 下标 1：8 号，另一根皮带，同一套传动；安装方向相反 */
+            8 => new MotorDefaults(3180, 1600, 800, true),
+            /* 下标 2：9 号，直线机构，轮径按实测 55731.2mm→578mm 反算；反向 */
+            9 => new MotorDefaults(622, 1600, 800, true),
+            /* 下标 4：11 号，钩爪机构，未标定；反向 */
+            11 => new MotorDefaults(UncalWheel001mm, UncalSpeed001mms, UncalAccel001mms2, true),
+            /* 下标 3：10 号，未标定 */
+            _ => new MotorDefaults(UncalWheel001mm, UncalSpeed001mms, UncalAccel001mms2, false),
         };
     }
 
