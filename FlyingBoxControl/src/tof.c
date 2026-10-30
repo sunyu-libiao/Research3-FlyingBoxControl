@@ -12,7 +12,9 @@
   * 协议文档（doc/tof8通讯协议.docx）与实际报文有出入，以 2026-10-29 实测为准：
   *   1. 发通道 10 开连续测距（B2=1）后，模块自动上报 0x0793，帧长 3 字节：
   *      B0 设备号 / B1~B2 距离 u16 LE。文档写的“B2~B3”是错的。
-  *   2. 自动上报大约 10 秒后自行停止，需要重新发一次通道 10 才会再开。
+  *   2. 自动上报大约 10 秒后自行停止。实测：停掉之后单独重发“开启”不能把流
+  *      拉回来，必须先关再开——Tof_PollTask 周期性做一次关→开脉冲来重启上报流。
+  *      这个“必须先关再开”的结论来自现场调试，未经单变量对照实验验证。
   *   3. 0x0794（距离+温度）实测从未上报，不做解析。
   *   4. 通道 12 读数应答 0x0409 是 5 字节：
   *      B0 设备号 / B1 通道 0x0C / B2~B3 距离 u16 LE / B4 序号。
@@ -51,6 +53,10 @@
 #define TOF_INIT_STACK_SIZE     128     /* 字                          */
 #define TOF_POLL_STACK_SIZE     128     /* 字：每轮只拼两帧就睡，很浅   */
 
+/* 配置帧之后到发出第一条测量命令之间的间隔。模块要时间把 0x0316 的参数写进去，
+   紧跟的通道命令会被丢掉，表现为“配置了但始终无读数”。 */
+#define TOF_CMD_GAP_MS          100u
+
 /* Private variables ---------------------------------------------------------*/
 static TofInfo s_tofs[TOF_MAX_COUNT];
 static int s_initResult = TOF_INIT_PENDING;
@@ -71,6 +77,7 @@ static const TofConfig s_defaultConfig =
 static uint8_t findIndexByDev(uint8_t devId);
 static void touchTof(uint8_t index);
 static int sendChannel(uint8_t index, uint8_t channel, uint8_t value);
+static int sendContinuous(uint8_t index, uint8_t enable);
 static void storeDistance(uint8_t index, uint16_t raw);
 static void parseResponse(const CAN_Frame *frame);
 static void parseReport(const CAN_Frame *frame);
@@ -112,9 +119,10 @@ static void touchTof(uint8_t index)
 
 /**
   * @brief  发一条 0x0408 通道请求（B2 填 value，其余补 0）。
+  *         通道 10 的结构不一样，它有 ROI 字段，必须用 sendContinuous()。
   * @param  index: 下标
   * @param  channel: 通道号，TOF_CH_*
-  * @param  value: B2，用于通道 10 的开关；无意义时传 0
+  * @param  value: B2，无意义时传 0
   * @retval 0 已发出，-1 失败
   */
 static int sendChannel(uint8_t index, uint8_t channel, uint8_t value)
@@ -130,6 +138,36 @@ static int sendChannel(uint8_t index, uint8_t channel, uint8_t value)
 	data[TOF_OFFSET_DEV] = s_tofs[index].devId;
 	data[TOF_OFFSET_CHANNEL] = channel;
 	data[TOF_OFFSET_VALUE] = value;
+
+	return CAN_Send(TOF_ID_REQUEST, data, TOF_FRAME_LEN);
+}
+
+/**
+  * @brief  发通道 10（连续测距开关）。
+  *
+  *         这个通道的帧结构和其它通道不同：除了 B2 的开关，B3/B4 还必须
+  *         带 ROI 起止。留 0 时模块会在不存在的区域里测距，读数恒为无效哨兵值，
+  *         表现为“命令开了但永远测不到距离”。
+  *         ROI 取值与 0x0316 配置帧保持一致，不另外写一套。
+  * @param  index: 下标
+  * @param  enable: 非 0 开，0 关
+  * @retval 0 已发出，-1 失败
+  */
+static int sendContinuous(uint8_t index, uint8_t enable)
+{
+	uint8_t data[TOF_FRAME_LEN];
+
+	if (index >= TOF_MAX_COUNT)
+	{
+		return -1;
+	}
+
+	memset(data, 0, sizeof(data));
+	data[TOF_OFFSET_DEV] = s_tofs[index].devId;
+	data[TOF_OFFSET_CHANNEL] = TOF_CH_CONTINUOUS;
+	data[TOF_OFFSET_VALUE] = (enable != 0u) ? 1u : 0u;
+	data[3] = s_defaultConfig.roiStart;
+	data[4] = s_defaultConfig.roiEnd;
 
 	return CAN_Send(TOF_ID_REQUEST, data, TOF_FRAME_LEN);
 }
@@ -242,6 +280,8 @@ static void parseReport(const CAN_Frame *frame)
 
 	storeDistance(index, (uint16_t)(frame->data[TOF_REPORT_OFFSET_DIST] |
 	                                ((uint16_t)frame->data[TOF_REPORT_OFFSET_DIST + 1u] << 8)));
+	/* 上报帧没有序号字段，本地自增；调用方靠 seq 变化判“是不是新样本” */
+	s_tofs[index].seq++;
 	s_tofs[index].reportCount++;
 	touchTof(index);
 }
@@ -352,7 +392,11 @@ int Tof_Config(uint8_t index, const TofConfig *config)
 }
 
 /**
-  * @brief  按默认配置初始化全部模块。
+  * @brief  按默认配置初始化全部模块：先下发 0x0316 参数，再开启连续测距。
+  *
+  *         ★ 连续测距（通道 10）必须发。只配 0x0316 时模块不会 startRanging，
+  *           通道 12 读到的永远是无效值 —— 这是“配置看起来成功但距离一直无效”
+  *           的直接原因。
   * @param  None
   * @retval 0 所有帧已发出，-1 至少一帧发送失败
   */
@@ -367,6 +411,18 @@ int Tof_ConfigAll(void)
 		{
 			result = -1;
 		}
+	}
+
+	/* 等参数真正写进模块，再开连续测距 */
+	osDelay(TOF_CMD_GAP_MS);
+
+	for (i = 0; i < TOF_COUNT; i++)
+	{
+		if (Tof_SetContinuous(i, 1) != 0)
+		{
+			result = -1;
+		}
+		osDelay(TOF_CMD_GAP_MS);
 	}
 
 	return result;
@@ -395,13 +451,17 @@ int Tof_GetInitResult(void)
 
 /**
   * @brief  0x0408 通道 10：连续测距开关。
+  *
+  *         距离靠模块的 0x0793 自动上报获取，而上报流过一段时间会自行停止
+  *         （连续测距本身不停）。重新把流拉起来需要先关再开，所以本函数
+  *         在重启路径上会被连着调用两次，由 Tof_PollTask 周期执行。
   * @param  index: 下标
   * @param  enable: 非 0 开，0 关
   * @retval 0 已发出，-1 失败
   */
 int Tof_SetContinuous(uint8_t index, uint8_t enable)
 {
-	return sendChannel(index, TOF_CH_CONTINUOUS, (enable != 0u) ? 1u : 0u);
+	return sendContinuous(index, enable);
 }
 
 /**
@@ -483,17 +543,23 @@ static void Tof_InitTask(void const *argument)
 }
 
 /**
-  * @brief  距离轮询任务：按 TOF_POLL_PERIOD_MS 周期向每个模块请求一次读数。
+  * @brief  上报流重启任务：按 TOF_RESTART_PERIOD_MS 对每个模块做一次“关→开”脉冲。
   *
-  *         模块不会主动推送数据（连续上报模式会自行停止，不可靠），只能主动
-  *         发通道 12 请求，应答由 CAN 接收任务写进 TofInfo。本任务只负责发请求。
+  *         距离完全依赖模块的 0x0793 自动上报，而那个上报流过一段时间会
+  *         自行停止，停下来之后 TofInfo 就冻在最后一次读数上（序号不再变）。
+  *
+  *         为什么不周期重发“开”：重复的开启命令不会让模块把上报流重新拉起来，
+  *         必须先关再开才能从干净的起点重新进流。先关后开是顺手把停掉的和
+  *         残留的状态一起清掉，比“开”再“开”更确定。
+  *         两帧背靠背发，中间不插入间隔：CAN 保证模块按序收到，模块会把
+  *         关闭先执行完再接开启。
+  *
+  *         不再周期发通道 12 请求读数：上报帧本身就是完整的距离数据，
+  *         没必要再查一次。
   *
   *         用 osDelayUntil 而不是 osDelay：前者的下一个唤醒时刻是“上上次 +
   *         周期”，发送耗时与调度抖动不会累积成周期漂移；后者会让实际周期
   *         变成“周期 + 每轮开销”。
-  *
-  *         ★ 周期快于模块自身的测量频率时，相邻两次应答会拿到同一个读数
-  *           （序号不增）。要判断数据是否真的刷新，看 TofInfo.seq 是否变化。
   * @param  argument 未使用
   * @retval None
   */
@@ -504,25 +570,28 @@ static void Tof_PollTask(void const *argument)
 
 	(void) argument;
 
-	/* 模块收到 0x0316 之前不应答测距请求，先等初始化任务跑完 */
+	/* 模块收到 0x0316 之前不接受通道命令，先用短间隔等初始化任务跑完。
+	   首次开启由 Tof_ConfigAll() 发，本任务只负责后续重启。 */
 	while (Tof_GetInitResult() == TOF_INIT_PENDING)
 	{
-		osDelay(TOF_POLL_PERIOD_MS);
+		osDelay(TOF_CMD_GAP_MS);
 	}
 
 	for (;;)
 	{
+		osDelayUntil(&wakeTick, TOF_RESTART_PERIOD_MS);
+
+		/* 关→开重启上报流；逐模块处理，让每个模块的重启尽量紧凑 */
 		for (i = 0; i < TOF_COUNT; i++)
 		{
-			(void)Tof_RequestDistance(i);
+			(void)Tof_SetContinuous(i, 0);
+			(void)Tof_SetContinuous(i, 1);
 		}
-
-		osDelayUntil(&wakeTick, TOF_POLL_PERIOD_MS);
 	}
 }
 
 /**
-  * @brief  创建距离轮询任务。调度器启动后才会真正跑。
+  * @brief  创建上报流重启任务。调度器启动后才会真正跑。
   * @param  None
   * @retval None
   */
