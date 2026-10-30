@@ -248,8 +248,10 @@ static void MotorControl_Task(void const *argument)
 	(void)Motor_WaitArrive(3, 5000);
 
 	/* 测试：9 号（下标 2）持续前进，直到 25 号 TOF（下标 0）测得的距离缩到阈值。
-	   前进时距离变小，所以 decreasing 传 1；方向反了就把 travel 的符号翻掉。 */
-	(void)MoveUntilTof(2, 0, 1000000, 3000, 1, 25000, 30000);
+	   前进时距离变小，所以 decreasing 传 1；方向反了就把 travel 的符号翻掉。
+	   travel 与 speed 是轮缘弧长量，必须与 9 号的轮径同量级；阈值来自 TOF，
+	   是真实的毫米量，不随轮径变化。 */
+	(void)MoveUntilTof(2, 0, 10367, 3000, 1, 259, 30000);
 
 	for (;;)
 	{

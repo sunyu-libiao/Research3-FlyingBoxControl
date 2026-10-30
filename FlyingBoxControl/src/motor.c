@@ -106,7 +106,9 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 		.speed001mms = 80000u,
 		.accel001mms2 = 40000u,
 		.params = { MOTOR_PARAMS_DEFAULT },
-		.homeTravel001mm = 0
+		.homeTravel001mm = 0,
+		.homeSpeed001mms = MOTOR_HOME_SPEED_001MMS,
+		.homeAccel001mms2 = MOTOR_HOME_ACCEL_001MMS2
 	},
 	/* 下标 1 / 设备号 8，安装方向相反，无绝对位置需求 */
 	{
@@ -115,19 +117,26 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 		.speed001mms = 80000u,
 		.accel001mms2 = 40000u,
 		.params = { MOTOR_PARAMS_DEFAULT },
-		.homeTravel001mm = 0
+		.homeTravel001mm = 0,
+		.homeSpeed001mms = MOTOR_HOME_SPEED_001MMS,
+		.homeAccel001mms2 = MOTOR_HOME_ACCEL_001MMS2
 	},
 	/* 下标 2 / 设备号 9，安装方向相反，向后找末端。
 	   这个值就是命令电机走的距离，要够从最远端走到头；等待时长也按它算，
 	   所以不能多填。符号表示“朝哪边找”，反向位会翻转内部正转方向，
-	   符号要不要跟着反向位走必须实测确认。 */
+	   符号要不要跟着反向位走必须实测确认。
+	   这里的轮径不是机械直径：按实测行程反算出的“电机每转对应的前进量”，
+	   与其余四台的默认值不是一个量级。位移/速度/加速度都是轮缘弧长量，
+	   必须与这个轮径同步标定，改一个就要改全部。 */
 	{
 		.reverse = 1,
-		.wheelDiameter001mm = 60000u,
-		.speed001mms = 80000u,
-		.accel001mms2 = 40000u,
+		.wheelDiameter001mm = 622u,
+		.speed001mms = 829u,
+		.accel001mms2 = 415u,
 		.params = { MOTOR_PARAMS_DEFAULT },
-		.homeTravel001mm = -700000
+		.homeTravel001mm = -7257,
+		.homeSpeed001mms = 829u,
+		.homeAccel001mms2 = 415u
 	},
 	/* 下标 3 / 设备号 10，暂不处理 */
 	{
@@ -136,7 +145,9 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 		.speed001mms = 80000u,
 		.accel001mms2 = 40000u,
 		.params = { MOTOR_PARAMS_DEFAULT },
-		.homeTravel001mm = -700000
+		.homeTravel001mm = -700000,
+		.homeSpeed001mms = MOTOR_HOME_SPEED_001MMS,
+		.homeAccel001mms2 = MOTOR_HOME_ACCEL_001MMS2
 	},
 	/* 下标 4 / 设备号 11，安装方向相反，向后找末端 */
 	{
@@ -145,7 +156,9 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 		.speed001mms = 80000u,
 		.accel001mms2 = 40000u,
 		.params = { MOTOR_PARAMS_DEFAULT },
-		.homeTravel001mm = -400000
+		.homeTravel001mm = -400000,
+		.homeSpeed001mms = MOTOR_HOME_SPEED_001MMS,
+		.homeAccel001mms2 = MOTOR_HOME_ACCEL_001MMS2
 	}
 };
 
@@ -158,7 +171,7 @@ static uint8_t findIndexByMotor(uint8_t motorId);
 static void touchMotor(uint8_t motorIndex);
 static int sendQuery(uint8_t motorIndex, uint8_t queryKind);
 static void parseQueryResponse(const CAN_Frame *frame);
-static uint32_t homeWaitMsFor(int32_t travel);
+static uint32_t homeWaitMsFor(int32_t travel, uint32_t speed001mms, uint32_t accel001mms2);
 static int configOneMotor(uint8_t motorIndex, uint32_t speed001mms, uint32_t accel001mms2);
 
 /* Private functions ---------------------------------------------------------*/
@@ -374,14 +387,16 @@ void Motor_Init(void)
   *         ★ 加速段距离含 v^2，速度量级放大后积会超出 32 位，必须用 64 位算，
   *           否则静默溢出，等待时长会被算短。
   * @param  travel: homeTravel001mm，0.1 mm，符号无关
+  * @param  speed001mms: 这一台的归位速度，0.1 mm/s
+  * @param  accel001mms2: 这一台的归位加速度，0.1 mm/s^2
   * @retval 估算耗时，ms
   */
-static uint32_t homeWaitMsFor(int32_t travel)
+static uint32_t homeWaitMsFor(int32_t travel, uint32_t speed001mms, uint32_t accel001mms2)
 {
 	uint32_t distance = (uint32_t)((travel < 0) ? -travel : travel);
-	uint32_t accelMs = (MOTOR_HOME_SPEED_001MMS * 1000u) / MOTOR_HOME_ACCEL_001MMS2;
-	uint32_t accelDist = (uint32_t)(((uint64_t)MOTOR_HOME_SPEED_001MMS * MOTOR_HOME_SPEED_001MMS) /
-	                                (2u * MOTOR_HOME_ACCEL_001MMS2));
+	uint32_t accelMs = (speed001mms * 1000u) / accel001mms2;
+	uint32_t accelDist = (uint32_t)(((uint64_t)speed001mms * speed001mms) /
+	                                (2u * accel001mms2));
 
 	if (distance <= accelDist)
 	{
@@ -389,7 +404,7 @@ static uint32_t homeWaitMsFor(int32_t travel)
 	}
 
 	return accelMs +
-	       (((distance - accelDist) * 1000u) / MOTOR_HOME_SPEED_001MMS);
+	       (((distance - accelDist) * 1000u) / speed001mms);
 }
 
 /**
@@ -499,10 +514,11 @@ int Motor_HomeByRelease(uint8_t motorIndex)
 		return 1;
 	}
 
-	/* 用归位专用的低速低加速重新配置这一台：小轮径下高速启动的电流峰值
-	   很容易撞上过流保护。 */
-	if (configOneMotor(motorIndex, MOTOR_HOME_SPEED_001MMS,
-	                   MOTOR_HOME_ACCEL_001MMS2) != 0)
+	/* 用这一台的归位参数重新配置：归位速度通常低于运行值，小轮径下高速
+	   启动的电流峰值很容易撞上过流保护。归位参数必须和轮径同量级，
+	   否则同样的数值在标定过的轮径上会快出两个数量级。 */
+	if (configOneMotor(motorIndex, s_motors[motorIndex].homeSpeed001mms,
+	                   s_motors[motorIndex].homeAccel001mms2) != 0)
 	{
 		return -1;
 	}
@@ -521,7 +537,8 @@ int Motor_HomeByRelease(uint8_t motorIndex)
 
 	/* 定时等待：时间按这段行程本身算，不是固定常数——改行程就会改上电耗时。
 	   余量就来自多填的行程：多出的距离 / 速度 = 多等的时间。 */
-	osDelay(homeWaitMsFor(travel));
+	osDelay(homeWaitMsFor(travel, s_motors[motorIndex].homeSpeed001mms,
+	                      s_motors[motorIndex].homeAccel001mms2));
 
 	/* 清掉未完成的目标。0x0416 相对命令的目标 = 当前位置 + Δ，此时剩余位移
 	   还很大，若直接置零并重新使能，电机会接着往后顶——必须先把目标改成

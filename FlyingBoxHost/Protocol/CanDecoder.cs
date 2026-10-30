@@ -332,12 +332,42 @@ internal static class CanCommand
     private const byte Param4 = 0x00;
     private const byte Param5 = 0x5F;
 
-    /* 固件 s_defaultMotors 里五台共用的运行参数 */
-    private const ushort Wheel001mm = 60000;
-    private const uint RunSpeed001mms = 80000;
-    private const uint RunAccel001mms2 = 40000;
+    /* 固件 s_defaultMotors 里五台的运动参数。逐台查表而不是共用一个常量：
+       9 号的轮径是按实测行程反算的，轮缘弧长量（位移/速度/加速度）也
+       跟着同量级缩放；若统一按默认值下发，本面板的“初始化”会把固件
+       配好的参数冲掉，之后所有位移与速度又变成错误的比例。 */
+    private const ushort DefaultWheel001mm = 60000;
+    private const uint DefaultSpeed001mms = 80000;
+    private const uint DefaultAccel001mms2 = 40000;
 
     private const byte MotorIdBase = 7;
+
+    /// <summary>一台电机在固件里的轮径、速度、加速度，以及方向反转位。</summary>
+    internal readonly record struct MotorDefaults(ushort Wheel001mm, uint Speed001mms,
+                                                 uint Accel001mms2, bool Reverse);
+
+    /// <summary>
+    /// 按马达号取固件里的运动参数。键是马达号，不是界面下标。
+    /// 固件改了 s_defaultMotors 而未同步这里时，本面板下发的内容会与固件不一致：
+    /// 方向位不一致会让电机朝反方向走，轮径不一致会让所有位移整体缩放。
+    /// </summary>
+    public static MotorDefaults DefaultsOf(byte motorId)
+    {
+        return motorId switch
+        {
+            /* 固件 s_defaultMotors[1]/[2]/[4]：安装方向相反；9 号单独标定过 */
+            8 => new MotorDefaults(DefaultWheel001mm, DefaultSpeed001mms, DefaultAccel001mms2, true),
+            9 => new MotorDefaults(622, 829, 415, true),
+            11 => new MotorDefaults(DefaultWheel001mm, DefaultSpeed001mms, DefaultAccel001mms2, true),
+            _ => new MotorDefaults(DefaultWheel001mm, DefaultSpeed001mms, DefaultAccel001mms2, false),
+        };
+    }
+
+    /// <summary>该马达号在固件里配置的轮径，0.01 mm。</summary>
+    public static ushort DefaultWheel001mmOf(byte motorId)
+    {
+        return DefaultsOf(motorId).Wheel001mm;
+    }
 
     /// <summary>
     /// 该马达号在固件里的方向反转位。界面据此预置复选框：
@@ -345,8 +375,7 @@ internal static class CanCommand
     /// </summary>
     public static bool DefaultReverse(byte motorId)
     {
-        /* 固件 s_defaultMotors：下标 1/2/4（设备号 8/9/11）安装方向相反 */
-        return motorId is 8 or 9 or 11;
+        return DefaultsOf(motorId).Reverse;
     }
 
     /// <summary>把一个 0~4 的下标换算成马达号；默认寻址下设备号与马达号相同。</summary>
@@ -368,7 +397,8 @@ internal static class CanCommand
     /// <param name="reverse">0x0316 的方向反转位</param>
     public static List<OutFrame> InitAndMove(byte motorId, int pos001mm, bool reverse)
     {
-        byte[] wheel = Wheel(motorId, Wheel001mm);
+        MotorDefaults defaults = DefaultsOf(motorId);
+        byte[] wheel = Wheel(motorId, defaults.Wheel001mm);
 
         return new List<OutFrame>
         {
@@ -376,8 +406,8 @@ internal static class CanCommand
             new(IdMulti, wheel, "轮径 1/3"),
             new(IdMulti, (byte[])wheel.Clone(), "轮径 2/3"),
             new(IdMulti, (byte[])wheel.Clone(), "轮径 3/3"),
-            new(IdAccelMain, U32WithMotorId(RunAccel001mms2, motorId), "加速度"),
-            new(IdSpeedMain, U32WithMotorId(RunSpeed001mms, motorId), "速度"),
+            new(IdAccelMain, U32WithMotorId(defaults.Accel001mms2, motorId), "加速度"),
+            new(IdSpeedMain, U32WithMotorId(defaults.Speed001mms, motorId), "速度"),
             new(IdEnable, Enable(motorId), "使能"),
             new(IdPositionMain, MoveRelative(pos001mm, motorId), "相对位移"),
         };
