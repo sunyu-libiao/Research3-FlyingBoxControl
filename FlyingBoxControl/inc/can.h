@@ -41,6 +41,8 @@ int      CAN_Send(uint32_t stdId, const uint8_t *data, uint8_t len);
 uint32_t CAN_GetTxErrorCount(void);
 uint32_t CAN_GetTxNoAckCount(void);
 uint32_t CAN_GetTxSentCount(void);
+/* 因“帧确定没上线”而重试的次数。持续增长说明总线在丢帧，但重试已把帧救回 */
+uint32_t CAN_GetTxRetryCount(void);
 uint32_t CAN_GetRxFrameCount(void);
 uint32_t CAN_GetLastRxId(void);
 uint32_t CAN_GetLastErrorCode(void);

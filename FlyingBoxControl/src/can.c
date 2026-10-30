@@ -21,6 +21,10 @@
   * 缺失的应答改成计数而不是当成错误。因此 CAN_Send() 表示的是“帧已经发出”，
   * 而不是“有人确认收到了”——本板之前的 ACK 伙伴是上位机工具。
   *
+  * 代价是链路层不再自动重传，失败即丢帧。所以 CAN_Send() 自己做了有限次重试，
+  * 但只在能证明“帧从未上线”时重试（无空闲邮箱、等待超时被撤销、仲裁失败）：
+  * TERR 置位时无法区分真传输错误与无应答，盲目重试会让相对位移指令下发两次。
+  *
   * 只在任务上下文使用。
   ******************************************************************************
   */
@@ -32,6 +36,11 @@
 
 /* Private define ------------------------------------------------------------*/
 #define CAN_TX_TIMEOUT_MS       100
+/* 单帧最多尝试次数。只有能证明“帧没上线”的情况才重试（没有空闲邮箱、等待
+   超时被撤销、仲裁失败），因为重复下发相对位移指令会让机构多走一段。
+   TERR 置位但 LEC 不是“无应答”时无法与无应答区分，一律不重试。 */
+#define CAN_TX_ATTEMPTS         3
+#define CAN_TX_RETRY_GAP_MS     1
 /* 队列深度：接收任务可能被回调阻塞几十毫秒，这段时间的突发流量要能装下。
    每帧占 sizeof(CAN_Frame)，队列从 configTOTAL_HEAP_SIZE 里分配。 */
 #define CAN_RX_QUEUE_LEN        64
@@ -45,6 +54,7 @@ static uint32_t rxLostCount;                /* 队列满而丢弃的帧数      
 static uint32_t txErrorCount;
 static uint32_t txNoAckCount;               /* 发出去但无人应答的帧数       */
 static uint32_t txSentCount;                /* 交给邮箱的帧数              */
+static uint32_t txRetryCount;               /* 因帧未上线而重试的次数      */
 static uint32_t rxFrameCount;               /* 收到的帧数，不论标识符      */
 static uint32_t lastRxId;                   /* 最后一帧的标识符            */
 
@@ -53,6 +63,7 @@ static osMutexId canTxMutexId;          /* 串行化任务级的 CAN_Send 调用
 osMutexDef(canTxMutex);
 
 /* Private function prototypes -----------------------------------------------*/
+static int canTransmitOnce(uint32_t stdId, const uint8_t *data, uint8_t len);
 static void CAN_ReceiveTask(void const *argument);
 
 /* Public functions ----------------------------------------------------------*/
@@ -137,20 +148,115 @@ int CAN_Init(void)
 }
 
 /**
-  * @brief  发送一帧标准数据帧，阻塞到它离开邮箱为止。
+  * @brief  尝试发送一帧，并用 TSR 里该邮箱的完成标志判断结果。
+  *
+  *         NART = 1 时发送失败也会立刻释放邮箱，所以“邮箱空了”不等于“帧发出去了”，
+  *         必须看 TXOK/ALST/TERR 才能区分。ALST（仲裁失败）与“没拿到邮箱”是
+  *         可以确定帧从未上线的，允许重试；TERR 可能与“无应答”混在一起，
+  *         分不清就不重试，宁可少发也不重复发（相对位移重复下发会让机构多走）。
+  * @param  stdId: 11 位标识符
+  * @param  data: 载荷（len = 0 时传 NULL）
+  * @param  len: 载荷长度 0-8
+  * @retval 1 帧已上线，0 帧确定未上线（可安全重试），-1 发送出错（不重试）
+  */
+static int canTransmitOnce(uint32_t stdId, const uint8_t *data, uint8_t len)
+{
+	CAN_TxHeaderTypeDef txHeader;
+	static const uint8_t emptyPayload[CAN_MAX_DLC] = { 0 };
+	uint32_t mailbox;
+	uint32_t rqcp;
+	uint32_t txok;
+	uint32_t alst;
+	uint32_t start;
+
+	txHeader.StdId = stdId & 0x7FF;
+	txHeader.ExtId = 0;
+	txHeader.IDE = CAN_ID_STD;
+	txHeader.RTR = CAN_RTR_DATA;
+	txHeader.DLC = len;
+	txHeader.TransmitGlobalTime = DISABLE;
+
+	/* 先清掉上一轮的完成标志：邮箱空不代表标志已清，否则会把旧结果当成本次的 */
+	hcan1.Instance->TSR = CAN_TSR_RQCP0 | CAN_TSR_RQCP1 | CAN_TSR_RQCP2;
+
+	/* HAL 把邮箱以位掩码形式返回（CAN_TX_MAILBOX0/1/2 = 1/2/4），这正是
+	   AbortTxRequest 需要的：不能再位移一次 */
+	if (HAL_CAN_AddTxMessage(&hcan1, &txHeader,
+	                         (data != NULL) ? (uint8_t *)data : (uint8_t *)emptyPayload,
+	                         &mailbox) != HAL_OK)
+	{
+		return 0;              /* 三个邮箱都占着，帧没进队列 */
+	}
+
+	switch (mailbox)
+	{
+	case CAN_TX_MAILBOX0:
+		rqcp = CAN_TSR_RQCP0;
+		txok = CAN_TSR_TXOK0;
+		alst = CAN_TSR_ALST0;
+		break;
+	case CAN_TX_MAILBOX1:
+		rqcp = CAN_TSR_RQCP1;
+		txok = CAN_TSR_TXOK1;
+		alst = CAN_TSR_ALST1;
+		break;
+	default:
+		rqcp = CAN_TSR_RQCP2;
+		txok = CAN_TSR_TXOK2;
+		alst = CAN_TSR_ALST2;
+		break;
+	}
+
+	start = HAL_GetTick();
+	while ((hcan1.Instance->TSR & rqcp) == 0)
+	{
+		if ((HAL_GetTick() - start) >= CAN_TX_TIMEOUT_MS)
+		{
+			/* 请求还没完成，撤销后帧确定没上线 */
+			(void)HAL_CAN_AbortTxRequest(&hcan1, mailbox);
+			hcan1.Instance->TSR = rqcp;
+			return 0;
+		}
+	}
+
+	if ((hcan1.Instance->TSR & txok) != 0)
+	{
+		hcan1.Instance->TSR = rqcp;
+		return 1;
+	}
+
+	if ((hcan1.Instance->ESR & CAN_ESR_LEC_Msk) >> CAN_ESR_LEC_Pos == 3U)
+	{
+		/* LEC 3 = ACK 错误：帧已完整上线，只是没有节点拉低应答槽。
+		   本总线的电机能解码并执行，但不驱动 ACK，所以按送达处理。 */
+		txNoAckCount++;
+		hcan1.Instance->TSR = rqcp;
+		return 1;
+	}
+
+	if ((hcan1.Instance->TSR & alst) != 0)
+	{
+		hcan1.Instance->TSR = rqcp;
+		return 0;              /* 仲裁失败，帧从未上线 */
+	}
+
+	/* 剩下的情况只有 TERR 置位：分不清是真传输错误还是无应答，按失败计 */
+	hcan1.Instance->TSR = rqcp;
+	return -1;
+}
+/**
+  * @brief  发送一帧标准数据帧，阻塞到它离开邮箱为止，失败时按情况重试。
   *         发送是一次性的，所以只要帧上一次总线就返回 0——不管有没有别的
   *         节点应答它。原因见文件头。
   * @param  stdId: 11 位标识符
   * @param  data: 载荷（len = 0 时传 NULL）
   * @param  len: 载荷长度 0-8
-  * @retval 帧已发出返回 0，失败或超时返回 -1
+  * @retval 帧已发出返回 0，重试后仍未发出返回 -1
   */
 int CAN_Send(uint32_t stdId, const uint8_t *data, uint8_t len)
 {
-	CAN_TxHeaderTypeDef txHeader;
-	static const uint8_t emptyPayload[CAN_MAX_DLC] = { 0 };
-	uint32_t mailbox;
-	uint32_t start;
+	uint8_t attempt;
+	int outcome;
 	int result = -1;
 
 	if ((len > CAN_MAX_DLC) || ((len > 0u) && (data == NULL)))
@@ -171,42 +277,23 @@ int CAN_Send(uint32_t stdId, const uint8_t *data, uint8_t len)
 		return -1;
 	}
 
-	txHeader.StdId = stdId & 0x7FF;
-	txHeader.ExtId = 0;
-	txHeader.IDE = CAN_ID_STD;
-	txHeader.RTR = CAN_RTR_DATA;
-	txHeader.DLC = len;
-	txHeader.TransmitGlobalTime = DISABLE;
-
-	/* HAL 把邮箱以位掩码形式返回（CAN_TX_MAILBOX0/1/2 = 1/2/4），这正是
-	   IsTxMessagePending/AbortTxRequest 需要的：不能再位移一次 */
-	if (HAL_CAN_AddTxMessage(&hcan1, &txHeader,
-	                         (data != NULL) ? (uint8_t *)data : (uint8_t *)emptyPayload,
-	                         &mailbox) == HAL_OK)
+	for (attempt = 0; attempt < CAN_TX_ATTEMPTS; attempt++)
 	{
-		txSentCount++;
-		start = HAL_GetTick();
-		while (HAL_GetTick() - start < CAN_TX_TIMEOUT_MS)
+		outcome = canTransmitOnce(stdId, data, len);
+		if (outcome > 0)
 		{
-			if (HAL_CAN_IsTxMessagePending(&hcan1, mailbox) == 0)
-			{
-				result = 0;    /* 一次性发送完成：帧已经出去了 */
-				break;
-			}
+			txSentCount++;
+			result = 0;
+			break;
 		}
-		if (result != 0)
+		if (outcome < 0)
 		{
-			HAL_CAN_AbortTxRequest(&hcan1, mailbox);
+			break;             /* 分不清是否已送达，不再重试 */
 		}
-		else if (((hcan1.Instance->ESR & CAN_ESR_LEC_Msk) >> CAN_ESR_LEC_Pos) == 3U)
-		{
-			/* LEC 3 = ACK 错误：发出去了，但没有任何节点应答。硬件在无错传输
-			   时会清 LEC，所以这属于刚刚发出的那一帧。本总线上属于正常，
-			   只做计数。 */
-			txNoAckCount++;
-		}
+
+		txRetryCount++;
+		osDelay(CAN_TX_RETRY_GAP_MS);
 	}
-	/* else：没有空闲邮箱 */
 
 	if (result != 0)
 	{
@@ -300,6 +387,17 @@ uint32_t CAN_GetTxNoAckCount(void)
 uint32_t CAN_GetTxSentCount(void)
 {
 	return txSentCount;
+}
+
+/**
+  * @brief  因为“帧确定没上线”而重试的次数。持续非零说明总线或邮箱调度在丢帧，
+  *         但重试已经把帧救回来了。
+  * @param  None
+  * @retval 重试次数
+  */
+uint32_t CAN_GetTxRetryCount(void)
+{
+	return txRetryCount;
 }
 
 /**

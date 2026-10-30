@@ -46,6 +46,9 @@
 /* Private variables ---------------------------------------------------------*/
 /* Private function prototypes -----------------------------------------------*/
 static int SystemClock_Config(void);
+static int MoveUntilTof(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
+                        uint16_t stopDistance, uint8_t decreasing,
+                        uint32_t speed, uint32_t timeoutMs);
 static void MotorControl_Task(void const *argument);
 /* Private functions ---------------------------------------------------------*/
 
@@ -89,10 +92,131 @@ static int SystemClock_Config(void)
 }
 
 /**
-  * @brief  电机任务。上电后一次性跑完启动流程，然后做一次测试动作并待命：
+  * @brief  让一台电机持续运动，直到 TOF 测得的距离满足条件时停住。
+  *
+  *         协议里没有“停止”指令，也没有速度模式，所以做法是：先压低接近速度，
+  *         再发一段足够长的相对位移让它自己跑，条件满足后把目标改成“当前位置”
+  *         （相对 0）令其减速停车。
+  *
+  *         为什么必须由调用方压低接近速度：停车是减速过程，还会继续走
+  *         v^2/(2a)；用运行速度接近会直接冲过阈值，根本没机会停。
+  *
+  *         判据要求连续多个**新样本**都满足才停，且必须 valid。只看 distance
+  *         会被两种情况骗过：无效读数下 distance 是 0（看起来“距离已很小”），
+  *         以及轮询快于模块测量时反复读到的同一个值。
+  *
+  *         无论怎么退出都会发出停车命令。返回后这台电机内部的速度是 speed，
+  *         结构体里的 speed001mms 并未改变，要恢复运行参数得重新 Motor_InitAll()。
+  * @param  motorIndex: 电机下标
+  * @param  tofIndex: TOF 下标
+  * @param  travel: 相对位移，0.1 mm，符号决定方向
+  * @param  stopDistance: 距离阈值，0.1 mm
+  * @param  decreasing: 1 = 距离缩到阈值以下时停（正在接近目标），0 = 反之
+  * @param  speed: 接近速度，0.1 mm/s
+  * @param  timeoutMs: 最长等待时间，ms
+  * @retval 0 条件满足已停，-1 超时，-2 TOF 无有效数据，-3 参数或发帧错误
+  */
+static int MoveUntilTof(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
+                        uint16_t stopDistance, uint8_t decreasing,
+                        uint32_t speed, uint32_t timeoutMs)
+{
+	/* 样本陈旧阈值：超时没新帧就当数据不可用，避免冻结值一直满足条件 */
+	enum
+	{
+		SAMPLE_STALE_MS = 500,
+		POLL_MS = 10,
+		NEED_HITS = 3
+	};
+
+	const TofInfo *tof;
+	uint32_t elapsed = 0;
+	uint8_t lastSeq = 0;
+	uint8_t haveSeq = 0;
+	uint8_t hits = 0;
+	int result = -1;
+
+	if ((motorIndex >= MOTOR_MAX_COUNT) || (tofIndex >= TOF_COUNT))
+	{
+		return -3;
+	}
+
+	tof = Tof_GetInfo(tofIndex);
+	if (tof == NULL)
+	{
+		return -3;
+	}
+
+	if (Motor_SetSpeedMain(motorIndex, speed) != 0)
+	{
+		return -3;
+	}
+	osDelay(MOTOR_INIT_FRAME_GAP_MS);
+
+	if (Motor_SetTargetPositionMain(motorIndex, travel, MOTOR_POS_RELATIVE) != 0)
+	{
+		return -3;
+	}
+
+	while (elapsed < timeoutMs)
+	{
+		if ((tof->valid != 0) &&
+		    ((HAL_GetTick() - tof->lastRxTick) < SAMPLE_STALE_MS))
+		{
+			if ((haveSeq == 0) || (tof->seq != lastSeq))
+			{
+				uint8_t reached;
+
+				haveSeq = 1;
+				lastSeq = tof->seq;
+
+				if (decreasing != 0)
+				{
+					reached = (tof->distance <= stopDistance) ? 1u : 0u;
+				}
+				else
+				{
+					reached = (tof->distance >= stopDistance) ? 1u : 0u;
+				}
+
+				if (reached != 0)
+				{
+					hits++;
+					if (hits >= NEED_HITS)
+					{
+						result = 0;
+						break;
+					}
+				}
+				else
+				{
+					hits = 0;
+				}
+			}
+		}
+
+		osDelay(POLL_MS);
+		elapsed += POLL_MS;
+	}
+
+	/* 区分“一直没数据”和“有数据但没满足条件” */
+	if ((result != 0) && (haveSeq == 0))
+	{
+		result = -2;
+	}
+
+	/* 所有退出路径都要停：不改目标的话电机会一直跑到行程尽头 */
+	(void)Motor_SetTargetPositionMain(motorIndex, 0, MOTOR_POS_RELATIVE);
+	osDelay(MOTOR_HOME_SETTLE_MS);
+
+	return result;
+}
+
+/**
+  * @brief  电机任务。上电后一次性跑完启动流程，然后做测试动作并待命：
   *         等电机复位 → 9 号单独初始化并归位 → 11 号单独初始化并归位 →
   *         全部重新初始化 → 全部使能 → 把此刻定义为绝对 0 →
-  *         其中一台做一次绝对定位（测试用）。
+  *         10 号绝对定位（把装置转到正前方）→
+  *         9 号持续前进，直到 TOF 距离满足条件时停车。
   *         整个流程是阻塞的（逐台等归位延时），期间本任务一直占着。
   *         不重试：失败只计数，由上层检查机械与参数。
   * @param  argument 未使用
@@ -105,14 +229,17 @@ static void MotorControl_Task(void const *argument)
 	/* 内部含上电等待与逐台归位，会阻塞几十秒 */
 	(void)Motor_BringUp();
 
-	/* 测试：下标 3（设备号 10，不参与归位）做一次绝对定位。运行参数已由
-	   Motor_BringUp() 末尾的 Motor_InitAll() 下发，且全部电机已使能，
-	   这里只管发目标位置。它不参与归位，绝对 0 是启动末尾置零那一刻的位置。 */
+	/* 10 号（下标 3，不参与归位）绝对定位，把装置转到正前方。运行参数已由
+	   Motor_BringUp() 末尾的 Motor_InitAll() 下发且已使能，这里只发目标位置。
+	   它不参与归位，绝对 0 是启动末尾置零那一刻的位置。
+	   必须先转到位再前进，否则测距方向不对。 */
 	(void)Motor_SetTargetPositionMain(3, 80000, MOTOR_POS_ABSOLUTE);
-
-	/* 到位判据用剩余位移：初始化完成后绝对 0 已建立，这趟运动不会去顶末端，
-	   电机不会触发保护释放，反馈会一路更新到 0。 */
 	(void)Motor_WaitArrive(3, 5000);
+
+	/* 测试：9 号（下标 2）持续前进，直到 25 号 TOF（下标 0）测得的距离缩到阈值。
+	   前进时距离变小，所以 decreasing 传 1；方向反了就把 travel 的符号翻掉。
+	   接近速度刻意压低：停车还要减速走一段，速度越高冲过阈值越多。 */
+	(void)MoveUntilTof(2, 0, 1000000, 3000, 1, 25000, 30000);
 
 	for (;;)
 	{

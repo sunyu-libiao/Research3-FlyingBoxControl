@@ -136,8 +136,10 @@ void Tof_InitTaskCreate(void);
 int Tof_GetInitResult(void);
 
 /* 距离轮询任务的周期，ms。模块只在被请求时回一帧距离，要持续拿到数据
-   就得周期发通道 12 请求。这条路径不受“自动上报会自行停止”的影响。 */
-#define TOF_POLL_PERIOD_MS      10u
+   就得周期发通道 12 请求。这条路径不受“自动上报会自行停止”的影响。
+   ★ 周期必须大于模块自身的测量周期，否则同一个读数会被反复请求到
+     （序号不增），去抖与判据都会失真。模块测量频率可用 Tof_QueryFrequency() 读回。 */
+#define TOF_POLL_PERIOD_MS      20u
 
 /* 创建一个常驻任务，按 TOF_POLL_PERIOD_MS 循环向每个模块请求一次距离，
    应答由 Tof_ParseFrame() 写进 TofInfo。
