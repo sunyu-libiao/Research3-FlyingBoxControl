@@ -123,8 +123,8 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 		.accel001mms2 = 1600u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = 0,
-		.homeSpeed001mms = 3200u,
-		.homeAccel001mms2 = 1600u
+		.homeSpeed001mms = 2400u,
+		.homeAccel001mms2 = 1200u
 	},
 	/* 下标 2 / 设备号 9，安装方向相反，向后找末端。
 	   这个值就是命令电机走的距离，要够从最远端走到头；等待时长也按它算，

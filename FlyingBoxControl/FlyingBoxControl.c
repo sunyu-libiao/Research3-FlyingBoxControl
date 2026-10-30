@@ -85,6 +85,19 @@
 #define BELT_APPROACH_SPEED        800u
 #define BELT_APPROACH_TIMEOUT_MS   30000u
 
+/* 皮带组从 26 号 TOF 前的停点退回到 11 cm 处：正位移 = 物理向前。
+   判据变成"距离变大"，刹车滞后只会让停点更远，不会撞上机械末端，
+   所以行程与速度都可以沿用接近那一组。 */
+#define BELT_FORWARD_TRAVEL        10000
+#define BELT_FORWARD_DISTANCE      1100u        /* 11 cm × 10，与 TOF 的 0.1 mm 单位一致 */
+#define BELT_FORWARD_TIMEOUT_MS    30000u
+
+/* 上一段动作停稳到下一段开始之间的静止间隔 */
+#define MOTOR_SEQ_PAUSE_MS         3000u
+
+/* 9 号第二段的绝对目标：50 cm = 500 mm，协议单位 0.1 mm */
+#define AXIS_FORWARD_TARGET        5000
+
 /* Private macro -------------------------------------------------------------*/
 /* Private variables ---------------------------------------------------------*/
 /* 电机任务的最后一次运动结果，调试时在调试器里直接看这个变量：
@@ -100,6 +113,15 @@ static volatile int8_t s_lastReturnResult = MOTOR_RETURN_SKIPPED;
    其余见 MoveGroupUntilTof() 的返回码。 */
 static volatile int8_t s_lastBeltResult = MOTOR_RETURN_SKIPPED;
 
+/* 7/8 号向前退回（TOF 距离超过 11 cm）的结果，取值同上。 */
+static volatile int8_t s_lastBeltForwardResult = MOTOR_RETURN_SKIPPED;
+
+/* 9 号绝对定位到 50 cm（7/8 号跟随）的结果，取值见 MoveAxisAbsoluteWithBelts()。 */
+static volatile int8_t s_lastAxisForwardResult = MOTOR_RETURN_SKIPPED;
+
+/* 最后 9 号单独回绝对 0 的结果，取值见 Motor_WaitArrive()。 */
+static volatile int8_t s_lastAxisZeroResult = MOTOR_RETURN_SKIPPED;
+
 /* Private function prototypes -----------------------------------------------*/
 static int SystemClock_Config(void);
 static int stopMotor(uint8_t motorIndex);
@@ -107,6 +129,8 @@ static int readPosition(uint8_t motorIndex, int32_t *position, uint32_t timeoutM
 static uint8_t isNearTarget(int32_t remain);
 static int ReturnAxisToOrigin(uint8_t motorIndex, uint8_t beltIndexA, uint8_t beltIndexB,
                               uint32_t timeoutMs);
+static int MoveAxisAbsoluteWithBelts(uint8_t motorIndex, uint8_t beltIndexA, uint8_t beltIndexB,
+                                     int32_t target, uint32_t arriveTimeoutMs);
 static int MoveGroupUntilTof(uint8_t count, const uint8_t *motorIndices, uint8_t tofIndex,
                              int32_t travel, uint16_t stopDistance, uint8_t decreasing,
                              uint32_t speed, uint32_t timeoutMs);
@@ -506,6 +530,74 @@ static int ReturnAxisToOrigin(uint8_t motorIndex, uint8_t beltIndexA, uint8_t be
 }
 
 /**
+  * @brief  主轴绝对定位，同时两根皮带按同一物理方向走同一距离；只等主轴到位。
+  *
+  *         与 ReturnAxisToOrigin() 的差别只在等待判据：这里皮带纯跟随，整段是否
+  *         走完由主轴说了算。等皮带一起进死区会让主轴到位后再白等一段——两台
+  *         皮带的速度与主轴不一定完全相同，收尾时刻对不齐。
+  *
+  *         距离同样由主轴坐标反推（目标 − 当前位置），三台走同一段，机构才是
+  *         刚性一起动；皮带不单独给参数。
+  *
+  *         ★ 三台的速度都要先恢复配置值。前面的接近动作把速度降到接近速度后
+  *           没有还原，不恢复的话主轴或皮带会明显落后，同一步里就不同步了。
+  * @param  motorIndex: 主轴下标
+  * @param  beltIndexA: 皮带 A 下标
+  * @param  beltIndexB: 皮带 B 下标
+  * @param  target: 主轴的绝对目标，0.1 mm
+  * @param  arriveTimeoutMs: 等主轴到位的最长时间
+  * @retval 0 主轴已到位，-1 参数错，-2 读不到主轴位置，-3 发帧失败，
+  *         其余负值见 Motor_WaitArrive()
+  */
+static int MoveAxisAbsoluteWithBelts(uint8_t motorIndex, uint8_t beltIndexA, uint8_t beltIndexB,
+                                     int32_t target, uint32_t arriveTimeoutMs)
+{
+	const MotorInfo *axis;
+	const MotorInfo *beltA;
+	const MotorInfo *beltB;
+	int32_t position;
+	int32_t travel;
+
+	axis = Motor_GetInfo(motorIndex);
+	beltA = Motor_GetInfo(beltIndexA);
+	beltB = Motor_GetInfo(beltIndexB);
+	if ((axis == NULL) || (beltA == NULL) || (beltB == NULL))
+	{
+		return -1;
+	}
+
+	if (readPosition(motorIndex, &position, MOTOR_POS_QUERY_TIMEOUT_MS) != 0)
+	{
+		return -2;
+	}
+
+	travel = target - position;
+	if ((travel <= MOTOR_ARRIVE_DEADBAND) && (travel >= -MOTOR_ARRIVE_DEADBAND))
+	{
+		/* 已经在目标附近，三台都不用动 */
+		return 0;
+	}
+
+	if ((Motor_SetSpeedMain(motorIndex, axis->speed001mms) != 0) ||
+	    (Motor_SetSpeedMain(beltIndexA, beltA->speed001mms) != 0) ||
+	    (Motor_SetSpeedMain(beltIndexB, beltB->speed001mms) != 0))
+	{
+		return -3;
+	}
+	osDelay(MOTOR_INIT_FRAME_GAP_MS);
+
+	/* 三帧连续发出：主轴绝对目标，两根皮带同一相对位移 */
+	if ((Motor_SetTargetPositionMain(motorIndex, target, MOTOR_POS_ABSOLUTE) != 0) ||
+	    (Motor_SetTargetPositionMain(beltIndexA, travel, MOTOR_POS_RELATIVE) != 0) ||
+	    (Motor_SetTargetPositionMain(beltIndexB, travel, MOTOR_POS_RELATIVE) != 0))
+	{
+		return -3;
+	}
+
+	return Motor_WaitArrive(motorIndex, arriveTimeoutMs);
+}
+
+/**
   * @brief  电机任务。上电后一次性跑完启动流程，然后做测试动作并待命：
   *         等电机复位 → 9 号单独初始化并归位 → 11 号单独初始化并归位 →
   *         全部重新初始化 → 全部使能 → 把此刻定义为绝对 0 →
@@ -515,7 +607,11 @@ static int ReturnAxisToOrigin(uint8_t motorIndex, uint8_t beltIndexA, uint8_t be
   *         9 号回绝对 0，同时 7/8 号按相同方向相同距离跟随 →
   *         11 号绝对定位到 10000 →
   *         10 号绝对定位到 225000 →
-  *         7/8 号同时向后走，直到 26 号 TOF 的距离小于 5 cm。
+  *         7/8 号同时向后走，直到 26 号 TOF 的距离小于 5 cm →
+  *         停 3 s → 7/8 号向前退回，直到 26 号 TOF 的距离超过 11 cm →
+  *         10 号绝对定位到 75000 →
+  *         9 号绝对定位到 50 cm，7/8 号同向同距跟随 →
+  *         9 号单独回绝对 0。
   *         整个流程是阻塞的（逐台等归位延时与到位），期间本任务一直占着。
   *         不重试：失败只计数，由上层检查机械与参数。
   * @param  argument 未使用
@@ -540,7 +636,7 @@ static void MotorControl_Task(void const *argument)
 	   travel 与 speed 是轮缘弧长量，必须与 9 号的轮径同量级；阈值来自 TOF，
 	   是真实的毫米量，不随轮径变化（协议单位 0.1 mm，mm × 10）。
 	   返回值留在 s_lastMoveResult 里，含义见该变量的声明处。 */
-	s_lastMoveResult = (int8_t)MoveUntilTof(2, 0, 10000, 1000, 1, 1000, 30000);
+	s_lastMoveResult = (int8_t)MoveUntilTof(2, 0, 10000, 1050, 1, 2000, 30000);
 
 	/* 9 号停定之后，11 号（下标 4）绝对定位。
 	   绝对 0 是 Motor_BringUp() 末尾置零那一刻的位置，与 9 号的停车位置无关，
@@ -582,9 +678,48 @@ static void MotorControl_Task(void const *argument)
 			static const uint8_t belts[2] = { 0u, 1u };
 
 			s_lastBeltResult = (int8_t)MoveGroupUntilTof(2u, belts, 1u,
-			                                             BELT_APPROACH_TRAVEL, 500u, 1u,
+			                                             BELT_APPROACH_TRAVEL, 600u, 1u,
 			                                             BELT_APPROACH_SPEED,
 			                                             BELT_APPROACH_TIMEOUT_MS);
+		}
+	}
+
+	/* 上一段停稳 3 s 之后再退回：接近结束时机构还有残余速度与回弹，
+	   立刻反向会让 TOF 读数带着振动，停下点不可重复。 */
+	if (s_lastBeltResult == 0)
+	{
+		osDelay(MOTOR_SEQ_PAUSE_MS);
+
+		/* 7/8 号同时向前（正位移）退出，直到 26 号 TOF（下标 1）的距离超过
+		   11 cm。距离变大，所以 decreasing 传 0。 */
+		{
+			static const uint8_t belts[2] = { 0u, 1u };
+
+			s_lastBeltForwardResult = (int8_t)MoveGroupUntilTof(2u, belts, 1u,
+			                                                    BELT_FORWARD_TRAVEL,
+			                                                    BELT_FORWARD_DISTANCE, 0u,
+			                                                    BELT_APPROACH_SPEED,
+			                                                    BELT_FORWARD_TIMEOUT_MS);
+		}
+	}
+
+	if (s_lastBeltForwardResult == 0)
+	{
+		/* 10 号（下标 3）从 240000 转回绝对 75000 */
+		(void)Motor_SetTargetPositionMain(3, 75000, MOTOR_POS_ABSOLUTE);
+		(void)Motor_WaitArrive(3, 10000);
+
+		/* 9 号（下标 2）绝对定位到 50 cm，7/8 号同向同距跟随；
+		   到位判据只看 9 号的剩余位移。 */
+		s_lastAxisForwardResult = (int8_t)MoveAxisAbsoluteWithBelts(2, 0, 1,
+		                                                           AXIS_FORWARD_TARGET,
+		                                                           MOTOR_RETURN_TIMEOUT_MS);
+
+		if (s_lastAxisForwardResult == 0)
+		{
+			/* 最后 9 号单独回绝对 0，7/8 号不动 */
+			(void)Motor_SetTargetPositionMain(2, 0, MOTOR_POS_ABSOLUTE);
+			s_lastAxisZeroResult = (int8_t)Motor_WaitArrive(2, MOTOR_RETURN_TIMEOUT_MS);
 		}
 	}
 
