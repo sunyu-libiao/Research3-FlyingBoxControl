@@ -118,9 +118,9 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 		.homeTravel001mm = 0
 	},
 	/* 下标 2 / 设备号 9，安装方向相反，向后找末端。
-	   -450000（600 mm 轮径下的 45000 mm 轮缘行程，约对应实际 1.5 m）
-	   就是命令电机走的距离，经验上实走 1.5 m 够从最远端走到头。
-	   等待时长同样按它算，所以不能多填。 */
+	   这个值就是命令电机走的距离，要够从最远端走到头；等待时长也按它算，
+	   所以不能多填。符号表示“朝哪边找”，反向位会翻转内部正转方向，
+	   符号要不要跟着反向位走必须实测确认。 */
 	{
 		.reverse = 1,
 		.wheelDiameter001mm = 60000u,
@@ -136,7 +136,7 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 		.speed001mms = 80000u,
 		.accel001mms2 = 40000u,
 		.params = { MOTOR_PARAMS_DEFAULT },
-		.homeTravel001mm = -1000000
+		.homeTravel001mm = -700000
 	},
 	/* 下标 4 / 设备号 11，安装方向相反，向后找末端 */
 	{
@@ -371,8 +371,8 @@ void Motor_Init(void)
   *         不需要知道机械尺寸。全部用 0.1 mm 系列单位，比值无量纲，乘 1000
   *         换算成毫秒。这里不加额外余量：余量靠 homeTravel001mm 多填。
   *
-  *         ★ 加速段距离含 v^2，按当前轮径下的速度值（1.5e5）已超出 32 位，
-  *           必须用 64 位算，否则得出发散的结果。
+  *         ★ 加速段距离含 v^2，速度量级放大后积会超出 32 位，必须用 64 位算，
+  *           否则静默溢出，等待时长会被算短。
   * @param  travel: homeTravel001mm，0.1 mm，符号无关
   * @retval 估算耗时，ms
   */
@@ -558,13 +558,11 @@ int Motor_HomeByRelease(uint8_t motorIndex)
   *         第 ⑤ 步对已置零的那几台是幂等的，对不参与归位的电机则是把当前
   *         位置直接定为原点，同时兜住"归位阶段因电机仍在保护释放而丢失"的情况。
   *
-  *         ★ 时间预算 10 s 左右。等待时长由 homeTravel001mm 推算（不是常数）：
-  *             2000（上电稳定）+ Σ(配置 20 + 使能 5 + 等待 + 稳定 200 + 间隔 5)
-  *             + 100（整组重新初始化）+ 25 + 25。
-  *           当前 600 mm 轮径（速度 300000 / 加速度 600000 / 归位速度 150000
-  *           / 归位加速度 60000）下：9 号 -450000 等 4250 ms，11 号 -300000
-  *           等 3250 ms，总计 ≈ 10.1 s。
-  *           改行程 / 速度 / 加速度 / 归位台数都要按这个式子重算。
+  *         ★ 总耗时 = 上电稳定 + 各台(配置 + 使能 + 归位等待 + 稳定 + 帧间隔)
+  *           + 整组重新初始化 + 全部使能 + 全部置零。
+  *           其中归位等待由 homeTravel001mm 与归位速度/加速度推算（见
+  *           homeWaitMsFor），所以改这几个参数或增删参与归位的台数都会改变
+  *           上电耗时，必须重算，不要沿用旧结论。
   *
   *         本函数是阻塞的（逐台按行程等待），只能在任务上下文调用。
   * @param  None
@@ -782,6 +780,53 @@ int Motor_SetTargetPositionMain(uint8_t motorIndex, int32_t position, uint8_t po
 	data[4] = s_motors[motorIndex].motorId;
 	data[5] = positionType;
 	return CAN_Send(MOTOR_ID_SET_POS_MAIN, data, 6);
+}
+
+/**
+  * @brief  等这台走到目标点：轮询 0x0420 剩余位移，绝对值落入死区即认为到位。
+  *
+  *         只适用于初始化完成之后的常规运动。那时绝对 0 已经建立，运动不会
+  *         去顶机械末端，电机不会触发保护释放，剩余位移会一路更新；归位阶段
+  *         不能用这条判据——顶到末端触发保护后连 0x0420 都不再上报。
+  *
+  *         用死区而不是等于 0：位置量有量化，实测到位后剩余位移停在 0 附近
+  *         一个到两个单位上且符号会抖，等“精确归零”会永远等不到。
+  *         判据要求先看到超出死区的值、再看到它落入死区，否则会把命令之前
+  *         留下的旧值当成就位；代价是距离短到两次反馈之间就走完时会报超时。
+  * @param  motorIndex: 下标
+  * @param  timeoutMs: 最长等待时间，ms
+  * @retval 0 已到位，-1 超时，-2 下标越界
+  */
+int Motor_WaitArrive(uint8_t motorIndex, uint32_t timeoutMs)
+{
+	const MotorInfo *info;
+	uint32_t elapsed = 0;
+	uint8_t moving = 0;
+
+	if (motorIndex >= MOTOR_MAX_COUNT)
+	{
+		return -2;
+	}
+
+	info = &s_motors[motorIndex];
+
+	while (elapsed < timeoutMs)
+	{
+		if ((info->remainMain > MOTOR_ARRIVE_DEADBAND) ||
+		    (info->remainMain < -MOTOR_ARRIVE_DEADBAND))
+		{
+			moving = 1;
+		}
+		else if (moving != 0)
+		{
+			return 0;
+		}
+
+		osDelay(MOTOR_ARRIVE_POLL_MS);
+		elapsed += MOTOR_ARRIVE_POLL_MS;
+	}
+
+	return -1;
 }
 
 /**

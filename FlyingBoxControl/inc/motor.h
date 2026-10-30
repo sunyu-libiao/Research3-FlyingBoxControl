@@ -54,16 +54,25 @@ extern "C" {
 
 /* 上电后到发出第一条初始化帧之前的等待。电机需要时间完成自身上电复位，
    过早下发 0x0316 会被静默丢弃（该帧无应答，丢了也看不出来）。
-   实测上电后约 1.5 s 内电机一帧都不发，这里取 2000 留余量；再往下压容易
-   踩到未复位的窗口，表现为刚开始就保护释放。
+   实测上电后的复位窗口内电机一帧都不发，这里的取值要在该窗口之上留余量；
+   往下压容易踩到未复位的窗口，表现为刚开始就保护释放。
    与 TOF_INIT_SETTLE_MS 相互独立，两个模块各自配置。 */
-#define MOTOR_INIT_SETTLE_MS    2000u
+#define MOTOR_INIT_SETTLE_MS    3000u
 
 /* 初始化帧之间的间隔。CAN_Send() 只阻塞到帧离开邮箱（1 Mbps 下约 0.1 ms），
    而 0x0316 要写参数、0x0408 要写轮径，电机处理跟不上连续帧；帧贴得太紧
    会让后面的 0x0413 静默落空，表现为“只有部分电机使能成功”。
    仅在初始化流程（任务上下文）里使用。 */
 #define MOTOR_INIT_FRAME_GAP_MS 5u
+
+/* 轮询剩余位移的间隔。0x0420 是电机主动上报的帧，间隔太密只是白占 CPU；
+   太稀则可能整段短行程都落在两次采样之间，既看不到非零、也就判不出到位。 */
+#define MOTOR_ARRIVE_POLL_MS    10u
+
+/* 到位死区，单位同剩余位移（0.1 mm）。电机不会精细停在 0：协议的位置量有
+   量化，实测到位后会停在 0 附近一个到两个单位上，且符号会抖。拿“等于 0”
+   当判据会永远等不到，必须用绝对值小于死区来判。 */
+#define MOTOR_ARRIVE_DEADBAND   5
 
 /* 目标位置类型（0x0416 Data[5]） */
 #define MOTOR_POS_RELATIVE      0x00    /* 相对当前位置 */
@@ -103,9 +112,9 @@ extern "C" {
 #define MOTOR_HOME_SPEED_001MMS 80000u
 
 /* 归位时临时下发的加速度，0.1 mm/s^2，同样随轮径缩放。
-   实测边界（当时轮径 20 mm）：运行加速度 20000 会在加速段就触发过流保护释放，
-   2000 能平稳走完。轮径改大后同样的角加速度对应的数值跟着放大，不能直接沿用
-   旧数字；归位这套值已按 600 mm 轮径换算过。
+   实测依据（当时轮径 20 mm）：运行加速度档位会在加速段就触发过流保护释放，
+   把加速度降到原值的十分之一就能平稳走完。边界是角加速度而不是协议数值，
+   所以轮径或速度一变就必须重新换算，不能沿用旧数字。
    ★ 一出现启动就掉电，先把这里减半，再降 MOTOR_HOME_SPEED_001MMS。 */
 #define MOTOR_HOME_ACCEL_001MMS2 40000u
 
@@ -255,8 +264,20 @@ uint32_t Motor_GetErrorFrameCount(void);
 
 /* ---- 控制指令。motorIndex 是状态表下标，不是报文里的地址字段。 ---------- */
 
-/* 0x0416 设置目标位置（主通道），position 单位 0.1 mm，positionType 见 MOTOR_POS_* */
+/* 0x0416 设置目标位置（主通道），position 单位 0.1 mm，positionType 见 MOTOR_POS_*
+   发完不会自动等它到位，需要的话接着调 Motor_WaitArrive()。 */
 int Motor_SetTargetPositionMain(uint8_t motorIndex, int32_t position, uint8_t positionType);
+
+/* 等这台走到目标点：轮询 0x0420 剩余位移，绝对值落在 MOTOR_ARRIVE_DEADBAND
+   以内即认为到位。
+   ★ 只适用于初始化完成之后的常规运动：那时绝对 0 已建立，运动不会再顶到
+     机械末端，电机不会触发保护释放，剩余位移会一路更新下去。归位阶段
+     不能用这条判据（保护后连反馈都没了）。
+   判据要求先看到超出死区的值、再看到它落入死区，只看“已经到位”会把命令
+   之前的旧值当成就位。代价是距离短到两次反馈之间就走完时会报超时。
+   会 osDelay，只能在任务上下文调用。
+   返回 0 已到位，-1 超时，-2 下标越界。 */
+int Motor_WaitArrive(uint8_t motorIndex, uint32_t timeoutMs);
 
 /* 0x0419 设置目标位置（从通道） */
 int Motor_SetTargetPositionSub(uint8_t motorIndex, int32_t position);
