@@ -107,7 +107,7 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 	{
 		.reverse = 0,
 		.wheelDiameter001mm = 3180u,
-		.speed001mms = 3200u,
+		.speed001mms = 4800u,
 		.accel001mms2 = 1600u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = 0,
@@ -119,12 +119,12 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 	{
 		.reverse = 1,
 		.wheelDiameter001mm = 3180u,
-		.speed001mms = 3200u,
+		.speed001mms = 4800u,
 		.accel001mms2 = 1600u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = 0,
-		.homeSpeed001mms = 2400u,
-		.homeAccel001mms2 = 1200u
+		.homeSpeed001mms = 3200u,
+		.homeAccel001mms2 = 1600u
 	},
 	/* 下标 2 / 设备号 9，安装方向相反，向后找末端。
 	   这个值就是命令电机走的距离，要够从最远端走到头；等待时长也按它算，
@@ -136,19 +136,19 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 	{
 		.reverse = 1,
 		.wheelDiameter001mm = 622u,
-		.speed001mms = 3200u,
+		.speed001mms = 4800u,
 		.accel001mms2 = 1600u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = -7257,
-		.homeSpeed001mms = 3200u,
-		.homeAccel001mms2 = 1600u
+		.homeSpeed001mms = 2400u,
+		.homeAccel001mms2 = 1200u
 	},
 	/* 下标 3 / 设备号 10，暂不处理 */
 	{
 		.reverse = 0,
 		.wheelDiameter001mm = 60000u,
-		.speed001mms = 160000u,
-		.accel001mms2 = 80000u,
+		.speed001mms = 320000u,
+		.accel001mms2 = 160000u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = -700000,
 		.homeSpeed001mms = MOTOR_HOME_SPEED_001MMS,
@@ -158,8 +158,8 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 	{
 		.reverse = 1,
 		.wheelDiameter001mm = 60000u,
-		.speed001mms = 160000u,
-		.accel001mms2 = 80000u,
+		.speed001mms = 320000u,
+		.accel001mms2 = 160000u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = -400000,
 		.homeSpeed001mms = MOTOR_HOME_SPEED_001MMS,
