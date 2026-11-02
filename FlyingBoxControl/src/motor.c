@@ -147,8 +147,8 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 	{
 		.reverse = 0,
 		.wheelDiameter001mm = 60000u,
-		.speed001mms = 800000u,
-		.accel001mms2 = 1000000u,
+		.speed001mms = 500000u,
+		.accel001mms2 = 600000u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = -700000,
 		.homeSpeed001mms = MOTOR_HOME_SPEED_001MMS,
@@ -158,8 +158,8 @@ static const MotorInfo s_defaultMotors[MOTOR_COUNT] =
 	{
 		.reverse = 1,
 		.wheelDiameter001mm = 60000u,
-		.speed001mms = 800000u,
-		.accel001mms2 = 1000000u,
+		.speed001mms = 500000u,
+		.accel001mms2 = 600000u,
 		.params = { MOTOR_PARAMS_DEFAULT },
 		.homeTravel001mm = -400000,
 		.homeSpeed001mms = MOTOR_HOME_SPEED_001MMS,

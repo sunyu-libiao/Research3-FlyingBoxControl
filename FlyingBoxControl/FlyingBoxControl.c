@@ -82,7 +82,7 @@
      加速度不变时速度翻倍就是四倍刹距；刹距一旦超过
      BELT_FORWARD_DISTANCE，必然冲过目标点。要提速得先加大加速度或放宽阈值。
      接近那一段由电机自己规划减速，不受这条限制。 */
-#define BELT_APPROACH_DISTANCE     800u         /* 终点要保留的距离，0.1 mm */
+#define BELT_APPROACH_DISTANCE     700u         /* 终点要保留的距离，0.1 mm */
 #define BELT_APPROACH_SPEED        5000u
 
 /* ---- 9 号接近箱子：两段式 ------------------------------------------------
@@ -114,7 +114,7 @@
 /* 定位段的终点间距，0.1 mm：不去贴箱子，就停在这个间距上。
    目标不是固定坐标，而是「当前读数 − 这一段」，所以从哪个位置出发都能停
    在同一间距上；不必预先知道机构现在在哪。 */
-#define AXIS_APPROACH_MARGIN       1400u
+#define AXIS_APPROACH_MARGIN       1350u
 #define AXIS_APPROACH_MARGIN_2     950u
 
 /* 定位段速度，0.1 mm/s。这一段是电机内部 PID 自己规划加减速、末端自己
