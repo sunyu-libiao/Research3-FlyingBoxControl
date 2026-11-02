@@ -75,16 +75,15 @@
    留 2 就够；需要更多就同步改这里。 */
 #define MOTOR_MOVE_GROUP_MAX       2u
 
-/* 皮带组向 26 号 TOF 接近：停车距离阈值、行程预算、速度与时限。
-   行程只要"够长"，真正的停车靠 TOF 判据，多余的行程不会走完；
-   但不能超过皮带机械行程，否则会顶到末端触发保护释放。
-   ★ 速度不能跟着运行参数一起翻倍。停车是减速过程，刹距约 v^2/(2a)，
-     加速度不变时速度翻倍就是四倍刹距；刹距一旦超过 BELT_APPROACH_DISTANCE，
-     必然冲过目标点。要提速得先加大加速度或放宽阈值。 */
-#define BELT_APPROACH_DISTANCE     700u         /* 停车距离阈值，0.1 mm；小于它即停 */
-#define BELT_APPROACH_TRAVEL       (-10000)     /* 负值 = 物理向后，与 homeTravel001mm 的符号惯例一致 */
-#define BELT_APPROACH_SPEED        800u
-#define BELT_APPROACH_TIMEOUT_MS   30000u
+/* 皮带组向 26 号 TOF 接近：终点要保留的距离与运行速度。行程不再固定，
+   而是每次按读数算出"还差多少"，所以起点在哪都能停在同一个距离上。
+   BELT_APPROACH_SPEED 同时被退回那一段沿用。
+   ★ 退回那一段仍是"跑到阈值再发停车帧"，停车是减速过程，刹距约 v^2/(2a)，
+     加速度不变时速度翻倍就是四倍刹距；刹距一旦超过
+     BELT_FORWARD_DISTANCE，必然冲过目标点。要提速得先加大加速度或放宽阈值。
+     接近那一段由电机自己规划减速，不受这条限制。 */
+#define BELT_APPROACH_DISTANCE     800u         /* 终点要保留的距离，0.1 mm */
+#define BELT_APPROACH_SPEED        5000u
 
 /* ---- 9 号接近箱子：两段式 ------------------------------------------------
    激光测距量程有限，距离远时根本没有读数（无效读数下 distance 恒为 0），
@@ -107,7 +106,7 @@
    ★ 这一段靠发一条新的相对目标接续，所以限速它的不是刹车距离，而是模块
      能稳定读到箱子的最远距离：新目标只能按已经测到的距离算，测到得太晚就
      来不及减速。提高之前先确认模块在更远处就能稳定给出有效读数。 */
-#define AXIS_SEEK_SPEED            3200u
+#define AXIS_SEEK_SPEED            5000u
 
 /* 盲走时限。按行程与速度估算后留出加速段与反馈延迟的余量。 */
 #define AXIS_SEEK_TIMEOUT_MS       15000u
@@ -115,7 +114,7 @@
 /* 定位段的终点间距，0.1 mm：不去贴箱子，就停在这个间距上。
    目标不是固定坐标，而是「当前读数 − 这一段」，所以从哪个位置出发都能停
    在同一间距上；不必预先知道机构现在在哪。 */
-#define AXIS_APPROACH_MARGIN       1200u
+#define AXIS_APPROACH_MARGIN       1400u
 #define AXIS_APPROACH_MARGIN_2     950u
 
 /* 定位段速度，0.1 mm/s。这一段是电机内部 PID 自己规划加减速、末端自己
@@ -130,12 +129,10 @@
    整段流程会白跑，所以这里按那个周期等一个完整窗口。 */
 #define TOF_VALID_WAIT_MS          (TOF_RESTART_PERIOD_MS + 2000u)
 
-/* 皮带组从 26 号 TOF 前的停点退回来：正位移 = 物理向前。
-   判据是"距离变大"，刹车滞后只会让停点更远，不会撞上机械末端，
-   所以行程与速度都可以沿用接近那一组。 */
-#define BELT_FORWARD_TRAVEL        10000
-#define BELT_FORWARD_DISTANCE      2000u        /* 退出距离阈值，0.1 mm；超过它即停 */
-#define BELT_FORWARD_TIMEOUT_MS    30000u
+/* 皮带组从 26 号 TOF 前的停点退回来（正位移 = 物理向前，距离变大）的终点距离。
+   ★ 退回必须比停点处的距离大，否则算出来的行程是零、原地不动：目标距离
+     落在当前读数的另一侧才会朝那个方向走。 */
+#define BELT_FORWARD_DISTANCE      2100u        /* 终点要保留的距离，0.1 mm */
 
 /* 上一段动作停稳到下一段开始之间的静止间隔 */
 #define MOTOR_SEQ_PAUSE_MS         3000u
@@ -163,11 +160,11 @@ static volatile int8_t s_lastApproachResult = MOTOR_RETURN_SKIPPED;
 static volatile int8_t s_lastReturnResult = MOTOR_RETURN_SKIPPED;
 
 /* 皮带组接近 TOF 的结果。MOTOR_RETURN_SKIPPED = 前面某步失败没执行，
-   其余见 MoveGroupUntilTof() 的返回码。 */
+   其余见 MoveGroupToTofDistance() 的返回码。 */
 static volatile int8_t s_lastBeltResult = MOTOR_RETURN_SKIPPED;
 
-/* 7/8 号向前退回（26 号 TOF 的距离超过 BELT_FORWARD_DISTANCE）的结果，
-   取值见 MoveGroupUntilTof()。 */
+/* 7/8 号向前退回到 BELT_FORWARD_DISTANCE 的结果，
+   取值见 MoveGroupToTofDistance()。 */
 static volatile int8_t s_lastBeltForwardResult = MOTOR_RETURN_SKIPPED;
 
 /* 9 号绝对定位到 AXIS_FORWARD_TARGET（7/8 号跟随）的结果，
@@ -186,15 +183,175 @@ static int ReturnAxisToOrigin(uint8_t motorIndex, uint8_t beltIndexA, uint8_t be
                               uint32_t timeoutMs);
 static int MoveAxisAbsoluteWithBelts(uint8_t motorIndex, uint8_t beltIndexA, uint8_t beltIndexB,
                                      int32_t target, uint32_t arriveTimeoutMs);
-static int MoveGroupUntilTof(uint8_t count, const uint8_t *motorIndices, uint8_t tofIndex,
-                             int32_t travel, uint16_t stopDistance, uint8_t decreasing,
-                             uint32_t speed, uint32_t timeoutMs);
 static int SeekTofValid(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
                         uint32_t speed, uint32_t timeoutMs);
 static int MoveForwardByTof(uint8_t motorIndex, uint8_t tofIndex, uint16_t margin,
                             uint32_t speed);
+static int MoveGroupToTofDistance(uint8_t count, const uint8_t *motorIndices, uint8_t tofIndex,
+                                  uint16_t margin, uint32_t speed);
 static void MotorControl_Task(void const *argument);
 /* Private functions ---------------------------------------------------------*/
+
+/**
+  * @brief  电机任务。上电后一次性跑完启动流程，然后做测试动作并待命：
+  *         等电机复位 → 9 号单独初始化并归位 → 11 号单独初始化并归位 →
+  *         全部重新初始化 → 全部使能 → 把此刻定义为绝对 0 →
+  *         10 号绝对定位（把装置转到正前方）→
+  *         9 号盲走到 TOF 能测到，再按读数定位到箱子前 →
+  *         11 号绝对定位到远端工位 →
+  *         9 号回绝对 0，同时 7/8 号按相同方向相同距离跟随 →
+  *         11 号绝对定位到近端工位 →
+  *         10 号绝对定位到另一端的工位 →
+  *         7/8 号按 26 号 TOF 读数同时向后定位到 BELT_APPROACH_DISTANCE 处 →
+  *         停 MOTOR_SEQ_PAUSE_MS → 7/8 号按读数向前定位到 BELT_FORWARD_DISTANCE →
+  *         10 号转回正前方工位 →
+  *         9 号按 25 号 TOF 读数再前进到箱子前 →
+  *         11 号绝对定位到爪端工位 →
+  *         9 号绝对定位到 AXIS_FORWARD_TARGET，7/8 号同向同距跟随 →
+  *         11 号先收回到近端工位，再让 9 号单独回绝对 0。
+  *         整个流程是阻塞的（逐台等归位延时与到位），期间本任务一直占着。
+  *         不重试：失败只计数，由上层检查机械与参数。
+  * @param  argument 未使用
+  * @retval None
+  */
+static void MotorControl_Task(void const *argument)
+{
+	(void) argument;
+
+	/* 内部含上电等待与逐台归位，会阻塞几十秒 */
+	(void)Motor_BringUp();
+
+	/* 10 号（下标 3，不参与归位）绝对定位，把装置转到正前方。运行参数已由
+	   Motor_BringUp() 末尾的 Motor_InitAll() 下发且已使能，这里只发目标位置。
+	   它不参与归位，绝对 0 是启动末尾置零那一刻的位置。
+	   必须先转到位再前进，否则测距方向不对。 */
+	(void)Motor_SetTargetPositionMain(3, 75000, MOTOR_POS_ABSOLUTE);
+	(void)Motor_WaitArrive(3, 5000);
+
+	/* 9 号（下标 2）两段式接近 25 号 TOF（下标 0）正对的箱子：
+	   ① 盲走到模块能测到箱子为止——量程之外没有读数，按读数算行程会算成负值；
+	   ② 按那一刻的读数做一次普通定位，终点留在箱子前 AXIS_APPROACH_MARGIN。
+	   返回值分别留在 s_lastSeekResult / s_lastMoveResult 里，含义见变量声明处。 */
+	s_lastSeekResult = (int8_t)SeekTofValid(2, 0, AXIS_SEEK_TRAVEL, AXIS_SEEK_SPEED,
+	                                        AXIS_SEEK_TIMEOUT_MS);
+
+	if (s_lastSeekResult == 0)
+	{
+		s_lastMoveResult = (int8_t)MoveForwardByTof(2, 0, AXIS_APPROACH_MARGIN,
+		                                            AXIS_APPROACH_SPEED);
+	}
+
+	/* 9 号停定之后，11 号（下标 4）绝对定位。
+	   绝对 0 是 Motor_BringUp() 末尾置零那一刻的位置，与 9 号的停车位置无关，
+	   所以这里给的是坐标值而不是相对量。11 号驱动的是钩爪类机构，行程没有
+	   可标定的直线关系，数值按它自己的配置单位走，不代表真实毫米。
+
+	   ★ 只有 9 号确实到位（0）才动 11 号。无有效读数（-1）、发帧失败（-2）、
+	     超时（-3）时 9 号可能还在动，此时再让 11 号动作会让两台机构
+	     同时运动，出问题无法归因。 */
+	if (s_lastMoveResult == 0)
+	{
+		(void)Motor_SetTargetPositionMain(4, 110000, MOTOR_POS_ABSOLUTE);
+		(void)Motor_WaitArrive(4, 5000);
+		/* 9 号回绝对 0，同时 7/8 号按同一物理方向走同一距离。
+		   距离由 9 号的当前坐标反推，不另外给参数；三台的符号与速度关系
+		   见 ReturnAxisToOrigin() 的说明。 */
+		s_lastReturnResult = (int8_t)ReturnAxisToOrigin(2, 0, 1, MOTOR_RETURN_TIMEOUT_MS);
+	}
+
+	/* 回原点成功后才做后面三步：那时 9 号与 7/8 都刚回到绝对 0，
+	   坐标系起点一致，后面的绝对定位才有确定含义。回原点失败就不做，
+	   避免在位置未知的情况下让别的轴动起来。 */
+	if (s_lastReturnResult == 0)
+	{
+		/* 11 号（下标 4）绝对定位到 10000 */
+		(void)Motor_SetTargetPositionMain(4, 10000, MOTOR_POS_ABSOLUTE);
+		(void)Motor_WaitArrive(4, 5000);
+
+		/* 10 号（下标 3）绝对定位到另一端的工位。数值是 10 号自己的坐标，
+		   与真实毫米没有标定关系。 */
+		(void)Motor_SetTargetPositionMain(3, 240000, MOTOR_POS_ABSOLUTE);
+		(void)Motor_WaitArrive(3, 10000);
+
+		/* 7/8 号按 26 号 TOF（下标 1）的读数同时向后定位到
+		   BELT_APPROACH_DISTANCE 处。用实时读数触发停车时，两台是逐台停的，
+		   速度一快就明显不同步，所以改成先量距离再一次性定位。
+		   ★ "距离变小"对应负的相对位移，依赖 TOF 装在跟随皮带靠近目标的那一侧；
+		     若实际是反的，把 MoveGroupToTofDistance() 里的行程符号翻掉即可。 */
+		{
+			static const uint8_t belts[2] = { 0u, 1u };
+
+			s_lastBeltResult = (int8_t)MoveGroupToTofDistance(2u, belts, 1u,
+			                                                 BELT_APPROACH_DISTANCE,
+			                                                 BELT_APPROACH_SPEED);
+		}
+	}
+
+	/* 上一段停稳 3 s 之后再退回：接近结束时机构还有残余速度与回弹，
+	   立刻反向会让 TOF 读数带着振动，停下点不可重复。 */
+	if (s_lastBeltResult == 0)
+	{
+		osDelay(MOTOR_SEQ_PAUSE_MS);
+
+		/* 7/8 号同时向前（正位移）退出，定位到 26 号 TOF（下标 1）的距离变成
+		   BELT_FORWARD_DISTANCE 处。和接近那一段同一个做法：量一次距离、
+		   发一条相对位移，行程的符号由读数决定。 */
+		{
+			static const uint8_t belts[2] = { 0u, 1u };
+
+			s_lastBeltForwardResult = (int8_t)MoveGroupToTofDistance(2u, belts, 1u,
+			                                                         BELT_FORWARD_DISTANCE,
+			                                                         BELT_APPROACH_SPEED);
+		}
+	}
+
+	if (s_lastBeltForwardResult == 0)
+	{
+		/* 10 号（下标 3）从 240000 转回绝对 75000 */
+		(void)Motor_SetTargetPositionMain(3, 75000, MOTOR_POS_ABSOLUTE);
+		(void)Motor_WaitArrive(3, 10000);
+
+		/* 装置转回正前方之后，再按 25 号 TOF（下标 0）的读数把 9 号送到箱子前。
+		   和第一次接近同一套做法：读数决定行程，末端由电机自己减速停住，
+		   所以起点坐标与上一次不同也不影响落点间距。 */
+		s_lastApproachResult = (int8_t)MoveForwardByTof(2, 0, AXIS_APPROACH_MARGIN_2,
+		                                                AXIS_APPROACH_SPEED);
+
+		if (s_lastApproachResult == 0)
+		{
+			/* 11 号（下标 4）绝对定位到 100000 */
+			(void)Motor_SetTargetPositionMain(4, 100000, MOTOR_POS_ABSOLUTE);
+			(void)Motor_WaitArrive(4, 5000);
+		}
+
+		/* 9 号（下标 2）绝对定位到 AXIS_FORWARD_TARGET，7/8 号同向同距跟随；
+		   到位判据只看 9 号的剩余位移。 */
+		s_lastAxisForwardResult = (int8_t)MoveAxisAbsoluteWithBelts(2, 0, 1,
+		                                                           AXIS_FORWARD_TARGET,
+		                                                           MOTOR_RETURN_TIMEOUT_MS);
+
+		if (s_lastAxisForwardResult == 0)
+		{
+			/* ★ 9 号后退之前必须先把 11 号的手臂收回来：钩子还插在箱子上时
+			   让 9 号退，会把箱子一起拖回去，或者直接钩住。
+			   所以这里串行等 11 号到位，到位了才启动 9 号；收不回来就不退，
+			   留在原地等上层处理，不带箱子跑。 */
+			(void)Motor_SetTargetPositionMain(4, 10000, MOTOR_POS_ABSOLUTE);
+
+			if (Motor_WaitArrive(4, 5000) == 0)
+			{
+				/* 最后 9 号单独回绝对 0，7/8 号不动 */
+				(void)Motor_SetTargetPositionMain(2, 0, MOTOR_POS_ABSOLUTE);
+				s_lastAxisZeroResult = (int8_t)Motor_WaitArrive(2, MOTOR_RETURN_TIMEOUT_MS);
+			}
+		}
+	}
+
+	for (;;)
+	{
+		osDelay(MOTOR_CTRL_IDLE_MS);
+	}
+}
 
 /**
   * @brief  系统时钟：HSE 8 MHz 经 PLL x9 得 SYSCLK 72 MHz。
@@ -281,138 +438,6 @@ static int stopMotor(uint8_t motorIndex)
 	}
 
 	return (sent != 0u) ? 0 : -5;
-}
-
-/**
-  * @brief  让一组电机同时持续运动，直到 TOF 测得的距离到达阈值时全部停住。
-  *
-  *         协议里没有“停止”指令，也没有速度模式，所以做法是：先发一段
-  *         足够长的相对位移让它们自己跑，条件满足后再让目标回到当前位置，
-  *         做法见 stopMotor() 的说明。
-  *
-  *         ★ 同时启动靠帧序：先把所有台的速度都发完，再连着发位移，
-  *           让位移帧之间只隔 CAN 发送时间。若写成“设一台速度就发一台位移”，
-  *           后一台会比前一台晚十几毫秒，同步就散了。
-  *
-  *         判据只有一条：读数 valid 且距离已经达到阈值。到了就全部停车。
-  *         valid 必须查——无效读数下 distance 被置 0，会被当成“已经贴到目标”，
-  *         一启动就停。
-  *
-  *         不要求“必须是新的一帧”，也不限制读数新鲜度：距离已经到了就该停，
-  *         `0x0793` 的上报周期由模块自己掌控且会变，拿固定窗口去卡它会让判据
-  *         永远不过。循环由 timeoutMs 兜底。
-  *
-  *         停车由 stopMotor() 逐台负责；任意一台的停车帧发不出去都返回 -5。
-  *         返回后这些电机内部的速度是 speed，结构体里的 speed001mms 并未改变，
-  *         要恢复运行参数得重新 Motor_InitAll()。
-  * @param  count: 电机台数，1~MOTOR_MOVE_GROUP_MAX
-  * @param  motorIndices: 电机下标数组
-  * @param  tofIndex: TOF 下标
-  * @param  travel: 每台的相对位移，0.1 mm，符号决定方向（组内同向同量）
-  * @param  stopDistance: 距离阈值，0.1 mm
-  * @param  decreasing: 1 = 距离缩到阈值以下时停（正在接近目标），0 = 反之
-  * @param  speed: 接近速度，0.1 mm/s
-  * @param  timeoutMs: 最长等待时间，ms
-  * @retval 0 条件满足且停车帧已发出，-1 超时，-2 始终无有效数据，
-  *         -3 参数或发帧错误，-5 至少一台停车帧发送失败
-  */
-static int MoveGroupUntilTof(uint8_t count, const uint8_t *motorIndices, uint8_t tofIndex,
-                             int32_t travel, uint16_t stopDistance, uint8_t decreasing,
-                             uint32_t speed, uint32_t timeoutMs)
-{
-	enum { POLL_MS = 10 };
-
-	const TofInfo *tof;
-	uint32_t elapsed = 0;
-	uint8_t everValid = 0;
-	uint8_t stopFailed = 0;
-	uint8_t i;
-	int result = -1;
-
-	if ((count == 0u) || (count > MOTOR_MOVE_GROUP_MAX) || (tofIndex >= TOF_COUNT))
-	{
-		return -3;
-	}
-
-	for (i = 0; i < count; i++)
-	{
-		if (motorIndices[i] >= MOTOR_MAX_COUNT)
-		{
-			return -3;
-		}
-	}
-
-	tof = Tof_GetInfo(tofIndex);
-	if (tof == NULL)
-	{
-		return -3;
-	}
-
-	/* 先把速度全部下发完，再发位移：顺序见函数说明里的“同时启动” */
-	for (i = 0; i < count; i++)
-	{
-		if (Motor_SetSpeedMain(motorIndices[i], speed) != 0)
-		{
-			return -3;
-		}
-		osDelay(MOTOR_INIT_FRAME_GAP_MS);
-	}
-
-	for (i = 0; i < count; i++)
-	{
-		if (Motor_SetTargetPositionMain(motorIndices[i], travel, MOTOR_POS_RELATIVE) != 0)
-		{
-			return -3;
-		}
-	}
-
-	while (elapsed < timeoutMs)
-	{
-		/* valid 必须查：无效读数下 distance 被置 0，会被当成“已经贴到目标” */
-		if (tof->valid != 0)
-		{
-			uint8_t reached;
-
-			everValid = 1;
-
-			if (decreasing != 0)
-			{
-				reached = (tof->distance <= stopDistance) ? 1u : 0u;
-			}
-			else
-			{
-				reached = (tof->distance >= stopDistance) ? 1u : 0u;
-			}
-
-			if (reached != 0)
-			{
-				result = 0;
-				break;
-			}
-		}
-
-		osDelay(POLL_MS);
-		elapsed += POLL_MS;
-	}
-
-	/* 区分“始终没数据”和“有数据但没到阈值” */
-	if ((result != 0) && (everValid == 0))
-	{
-		result = -2;
-	}
-
-	/* 停车是安全路径：每台都要停，任意一台失败都要报出来 */
-	for (i = 0; i < count; i++)
-	{
-		if (stopMotor(motorIndices[i]) != 0)
-		{
-			stopFailed = 1;
-		}
-	}
-
-	osDelay(MOTOR_HOME_SETTLE_MS);
-
-	return (stopFailed != 0u) ? -5 : result;
 }
 
 /**
@@ -509,9 +534,9 @@ static int SeekTofValid(uint8_t motorIndex, uint8_t tofIndex, int32_t travel,
   *         行程 = 当前读数 − margin，一次性算出来发给电机，之后由电机内部的
   *         PID 自己规划加减速、在末端自己减速停住。
   *
-  *         ★ 比 MoveGroupUntilTof() 那条路平滑得多。那条是“高速跑到阈值再发
-  *           停车帧”，停车属于运动中打断，必然有减速滞后与超调，接近速度
-  *           稍高就会顶到目标物；这里从头到尾就是一个普通的定位动作。
+  *         ★ 不用"高速跑到阈值再发停车帧"那套判据：那是运动中打断，必然有
+  *           减速滞后与超调，接近速度稍高就会顶到目标物；这里从头到尾就是
+  *           一个普通的定位动作。
   *
   *         ★ 可能是在运动中被调用的：盲走段（SeekTofValid）测到读数后不停车，
   *           直接把接续工作交给这里。新发的相对目标会覆盖盲走那条，电机自己
@@ -582,6 +607,152 @@ static int MoveForwardByTof(uint8_t motorIndex, uint8_t tofIndex, uint16_t margi
 	}
 
 	return (Motor_WaitArrive(motorIndex, timeoutMs) == 0) ? 0 : -3;
+}
+
+/**
+  * @brief  按 TOF 读数把一组电机同时定位到指定距离处。
+  *
+  *         做法与 MoveForwardByTof() 相同，只是作用于多台：只读一次距离，
+  *         把「目标距离 − 当前距离」算成一段相对位移，背靠背发给全部台，
+  *         由电机内部的 PID 各自规划加减速、停在自己的目标点上——各台走的是
+  *         同一段长度，落点自然对齐。
+  *
+  *         ★ 不要改回「先跑起来、读数到阈值再逐台发停车帧」：停车帧是逐台发的，
+  *           两台之间隔着几条帧的时间，速度一快就停在不同的时刻、停点也差开。
+  *         ★ 目标距离落在当前读数的哪一侧就朝哪边定位，所以接近与退回共用这一个
+  *           函数；它依赖「相对位移为正时读数变大」，TOF 装反了要翻符号。
+  *         ★ 落点精度取决于这一次读数：读数偏一下，全部台一起偏同样的量。
+  *           换来的是台与台之间的同步，这是这里要的。
+  *         ★ 读无效时先等一个重启窗口（Tof_PollTask 会周期性关→开连续测距，
+  *           那段窗口里读数是无效的），等不到才判失败。
+  * @param  count: 电机台数，1~MOTOR_MOVE_GROUP_MAX
+  * @param  motorIndices: 电机下标数组
+  * @param  tofIndex: TOF 下标
+  * @param  margin: 终点要保留的距离，0.1 mm
+  * @param  speed: 运行速度，0.1 mm/s
+  * @retval 0 已到位（或本来就在余量以内，无需移动），-1 参数错或始终没有
+  *         有效读数，-2 发帧失败，-3 等到位超时（已发停车帧），
+  *         -5 超时后停车帧发送失败
+  */
+static int MoveGroupToTofDistance(uint8_t count, const uint8_t *motorIndices, uint8_t tofIndex,
+                                  uint16_t margin, uint32_t speed)
+{
+	enum { POLL_MS = 20 };
+
+	const TofInfo *tof;
+	const MotorInfo *info;
+	int32_t travel;
+	uint32_t elapsed = 0;
+	uint32_t timeoutMs;
+	uint8_t moving = 0;
+	uint8_t stopFailed = 0;
+	uint8_t i;
+
+	if ((count == 0u) || (count > MOTOR_MOVE_GROUP_MAX) || (tofIndex >= TOF_COUNT) ||
+	    (speed == 0u))
+	{
+		return -1;
+	}
+
+	for (i = 0; i < count; i++)
+	{
+		if (motorIndices[i] >= MOTOR_MAX_COUNT)
+		{
+			return -1;
+		}
+	}
+
+	tof = Tof_GetInfo(tofIndex);
+	if (tof == NULL)
+	{
+		return -1;
+	}
+
+	while ((tof->valid == 0u) && (elapsed < TOF_VALID_WAIT_MS))
+	{
+		osDelay(POLL_MS);
+		elapsed += POLL_MS;
+	}
+
+	if (tof->valid == 0u)
+	{
+		return -1;
+	}
+
+	/* 相对位移为正时读数变大（本机皮带的 reverse 已调成"正数 = 同一物理
+	   方向"）。目标距离落在哪一侧就朝哪边走，接近与退回都成立。 */
+	travel = (int32_t)margin - (int32_t)tof->distance;
+	if ((travel <= MOTOR_ARRIVE_DEADBAND) && (travel >= -MOTOR_ARRIVE_DEADBAND))
+	{
+		/* 已经在目标距离上，不用再走 */
+		return 0;
+	}
+
+	/* 时限按行程与速度自己算：TOF 量程内的行程跨度很大，写死一个值不是
+	   太短就是太长，两种都会误判 */
+	timeoutMs = (uint32_t)(((uint64_t)((travel < 0) ? -travel : travel) * 1000u) /
+	                       (uint64_t)speed) + AXIS_APPROACH_EXTRA_MS;
+
+	/* 先把速度全部下发完，再发位移：若写成"设一台速度就发一台位移"，
+	   后一台会比前一台晚十几毫秒，同步就散了 */
+	for (i = 0; i < count; i++)
+	{
+		if (Motor_SetSpeedMain(motorIndices[i], speed) != 0)
+		{
+			return -2;
+		}
+		osDelay(MOTOR_INIT_FRAME_GAP_MS);
+	}
+
+	/* 位移帧背靠背发出，让各台几乎同时启动 */
+	for (i = 0; i < count; i++)
+	{
+		if (Motor_SetTargetPositionMain(motorIndices[i], travel, MOTOR_POS_RELATIVE) != 0)
+		{
+			return -2;
+		}
+	}
+
+	/* 等全部到位。必须见过至少一台"确实在动"之后，才承认全部进入死区，
+	   否则命令刚发出时读到的旧剩余值（0）会被当成"已经到位"。 */
+	elapsed = 0;
+	while (elapsed < timeoutMs)
+	{
+		uint8_t allNear = 1u;
+
+		for (i = 0; i < count; i++)
+		{
+			info = Motor_GetInfo(motorIndices[i]);
+			if ((info->remainMain > MOTOR_ARRIVE_DEADBAND) ||
+			    (info->remainMain < -MOTOR_ARRIVE_DEADBAND))
+			{
+				moving = 1u;
+				allNear = 0u;
+				break;
+			}
+		}
+
+		if ((allNear != 0u) && (moving != 0u))
+		{
+			return 0;
+		}
+
+		osDelay(POLL_MS);
+		elapsed += POLL_MS;
+	}
+
+	/* 超时：目标没走到，但机构可能还在跑，必须停住 */
+	for (i = 0; i < count; i++)
+	{
+		if (stopMotor(motorIndices[i]) != 0)
+		{
+			stopFailed = 1u;
+		}
+	}
+
+	osDelay(MOTOR_HOME_SETTLE_MS);
+
+	return (stopFailed != 0u) ? -5 : -3;
 }
 
 /**
@@ -746,7 +917,7 @@ static int ReturnAxisToOrigin(uint8_t motorIndex, uint8_t beltIndexA, uint8_t be
   *         距离同样由主轴坐标反推（目标 − 当前位置），三台走同一段，机构才是
   *         刚性一起动；皮带不单独给参数。
   *
-  *         ★ 三台的速度都要先恢复配置值。SeekTofValid() / MoveGroupUntilTof()
+  *         ★ 三台的速度都要先恢复配置值。SeekTofValid() / MoveGroupToTofDistance()
   *           把速度改成各自那一段的值后没有还原，不恢复的话主轴或皮带会明显
   *           落后，同一步里就不同步了。
   * @param  motorIndex: 主轴下标
@@ -805,172 +976,7 @@ static int MoveAxisAbsoluteWithBelts(uint8_t motorIndex, uint8_t beltIndexA, uin
 	return Motor_WaitArrive(motorIndex, arriveTimeoutMs);
 }
 
-/**
-  * @brief  电机任务。上电后一次性跑完启动流程，然后做测试动作并待命：
-  *         等电机复位 → 9 号单独初始化并归位 → 11 号单独初始化并归位 →
-  *         全部重新初始化 → 全部使能 → 把此刻定义为绝对 0 →
-  *         10 号绝对定位（把装置转到正前方）→
-  *         9 号盲走到 TOF 能测到，再按读数定位到箱子前 →
-  *         11 号绝对定位到远端工位 →
-  *         9 号回绝对 0，同时 7/8 号按相同方向相同距离跟随 →
-  *         11 号绝对定位到近端工位 →
-  *         10 号绝对定位到另一端的工位 →
-  *         7/8 号同时向后走，直到 26 号 TOF 的距离小于 BELT_APPROACH_DISTANCE →
-  *         停 MOTOR_SEQ_PAUSE_MS → 7/8 号向前退回，直到距离超过
-  *         BELT_FORWARD_DISTANCE →
-  *         10 号转回正前方工位 →
-  *         9 号按 25 号 TOF 读数再前进到箱子前 →
-  *         11 号绝对定位到爪端工位 →
-  *         9 号绝对定位到 AXIS_FORWARD_TARGET，7/8 号同向同距跟随 →
-  *         11 号先收回到近端工位，再让 9 号单独回绝对 0。
-  *         整个流程是阻塞的（逐台等归位延时与到位），期间本任务一直占着。
-  *         不重试：失败只计数，由上层检查机械与参数。
-  * @param  argument 未使用
-  * @retval None
-  */
-static void MotorControl_Task(void const *argument)
-{
-	(void) argument;
 
-	/* 内部含上电等待与逐台归位，会阻塞几十秒 */
-	(void)Motor_BringUp();
-
-	/* 10 号（下标 3，不参与归位）绝对定位，把装置转到正前方。运行参数已由
-	   Motor_BringUp() 末尾的 Motor_InitAll() 下发且已使能，这里只发目标位置。
-	   它不参与归位，绝对 0 是启动末尾置零那一刻的位置。
-	   必须先转到位再前进，否则测距方向不对。 */
-	(void)Motor_SetTargetPositionMain(3, 75000, MOTOR_POS_ABSOLUTE);
-	(void)Motor_WaitArrive(3, 5000);
-
-	osDelay(1000);
-
-	/* 9 号（下标 2）两段式接近 25 号 TOF（下标 0）正对的箱子：
-	   ① 盲走到模块能测到箱子为止——量程之外没有读数，按读数算行程会算成负值；
-	   ② 按那一刻的读数做一次普通定位，终点留在箱子前 AXIS_APPROACH_MARGIN。
-	   返回值分别留在 s_lastSeekResult / s_lastMoveResult 里，含义见变量声明处。 */
-	s_lastSeekResult = (int8_t)SeekTofValid(2, 0, AXIS_SEEK_TRAVEL, AXIS_SEEK_SPEED,
-	                                        AXIS_SEEK_TIMEOUT_MS);
-
-	if (s_lastSeekResult == 0)
-	{
-		s_lastMoveResult = (int8_t)MoveForwardByTof(2, 0, AXIS_APPROACH_MARGIN,
-		                                            AXIS_APPROACH_SPEED);
-	}
-
-	/* 9 号停定之后，11 号（下标 4）绝对定位。
-	   绝对 0 是 Motor_BringUp() 末尾置零那一刻的位置，与 9 号的停车位置无关，
-	   所以这里给的是坐标值而不是相对量。11 号驱动的是钩爪类机构，行程没有
-	   可标定的直线关系，数值按它自己的配置单位走，不代表真实毫米。
-
-	   ★ 只有 9 号确实到位（0）才动 11 号。无有效读数（-1）、发帧失败（-2）、
-	     超时（-3）时 9 号可能还在动，此时再让 11 号动作会让两台机构
-	     同时运动，出问题无法归因。 */
-	if (s_lastMoveResult == 0)
-	{
-		(void)Motor_SetTargetPositionMain(4, 110000, MOTOR_POS_ABSOLUTE);
-		(void)Motor_WaitArrive(4, 5000);
-		/* 9 号回绝对 0，同时 7/8 号按同一物理方向走同一距离。
-		   距离由 9 号的当前坐标反推，不另外给参数；三台的符号与速度关系
-		   见 ReturnAxisToOrigin() 的说明。 */
-		s_lastReturnResult = (int8_t)ReturnAxisToOrigin(2, 0, 1, MOTOR_RETURN_TIMEOUT_MS);
-	}
-
-	/* 回原点成功后才做后面三步：那时 9 号与 7/8 都刚回到绝对 0，
-	   坐标系起点一致，后面的绝对定位才有确定含义。回原点失败就不做，
-	   避免在位置未知的情况下让别的轴动起来。 */
-	if (s_lastReturnResult == 0)
-	{
-		/* 11 号（下标 4）绝对定位到 10000 */
-		(void)Motor_SetTargetPositionMain(4, 10000, MOTOR_POS_ABSOLUTE);
-		(void)Motor_WaitArrive(4, 5000);
-
-		/* 10 号（下标 3）绝对定位到另一端的工位。数值是 10 号自己的坐标，
-		   与真实毫米没有标定关系。 */
-		(void)Motor_SetTargetPositionMain(3, 240000, MOTOR_POS_ABSOLUTE);
-		(void)Motor_WaitArrive(3, 10000);
-
-		/* 7/8 号同时向后走，直到 26 号 TOF（下标 1）的距离小于
-		   BELT_APPROACH_DISTANCE。decreasing = 1 表示距离缩小时停。
-		   ★ 向后（负位移）与“距离要变小”必须同时成立，这依赖 TOF 装在
-		     跟随皮带靠近目标的那一侧。若实际是反的，把 BELT_APPROACH_TRAVEL
-		     的符号翻掉即可。 */
-		{
-			static const uint8_t belts[2] = { 0u, 1u };
-
-			s_lastBeltResult = (int8_t)MoveGroupUntilTof(2u, belts, 1u,
-			                                             BELT_APPROACH_TRAVEL,
-			                                             BELT_APPROACH_DISTANCE, 1u,
-			                                             BELT_APPROACH_SPEED,
-			                                             BELT_APPROACH_TIMEOUT_MS);
-		}
-	}
-
-	/* 上一段停稳 3 s 之后再退回：接近结束时机构还有残余速度与回弹，
-	   立刻反向会让 TOF 读数带着振动，停下点不可重复。 */
-	if (s_lastBeltResult == 0)
-	{
-		osDelay(MOTOR_SEQ_PAUSE_MS);
-
-		/* 7/8 号同时向前（正位移）退出，直到 26 号 TOF（下标 1）的距离超过
-		   BELT_FORWARD_DISTANCE。距离变大，所以 decreasing 传 0。 */
-		{
-			static const uint8_t belts[2] = { 0u, 1u };
-
-			s_lastBeltForwardResult = (int8_t)MoveGroupUntilTof(2u, belts, 1u,
-			                                                    BELT_FORWARD_TRAVEL,
-			                                                    BELT_FORWARD_DISTANCE, 0u,
-			                                                    BELT_APPROACH_SPEED,
-			                                                    BELT_FORWARD_TIMEOUT_MS);
-		}
-	}
-
-	if (s_lastBeltForwardResult == 0)
-	{
-		/* 10 号（下标 3）从 240000 转回绝对 75000 */
-		(void)Motor_SetTargetPositionMain(3, 75000, MOTOR_POS_ABSOLUTE);
-		(void)Motor_WaitArrive(3, 10000);
-
-		/* 装置转回正前方之后，再按 25 号 TOF（下标 0）的读数把 9 号送到箱子前。
-		   和第一次接近同一套做法：读数决定行程，末端由电机自己减速停住，
-		   所以起点坐标与上一次不同也不影响落点间距。 */
-		s_lastApproachResult = (int8_t)MoveForwardByTof(2, 0, AXIS_APPROACH_MARGIN_2,
-		                                                AXIS_APPROACH_SPEED);
-
-		if (s_lastApproachResult == 0)
-		{
-			/* 11 号（下标 4）绝对定位到 100000 */
-			(void)Motor_SetTargetPositionMain(4, 100000, MOTOR_POS_ABSOLUTE);
-			(void)Motor_WaitArrive(4, 5000);
-		}
-
-		/* 9 号（下标 2）绝对定位到 AXIS_FORWARD_TARGET，7/8 号同向同距跟随；
-		   到位判据只看 9 号的剩余位移。 */
-		s_lastAxisForwardResult = (int8_t)MoveAxisAbsoluteWithBelts(2, 0, 1,
-		                                                           AXIS_FORWARD_TARGET,
-		                                                           MOTOR_RETURN_TIMEOUT_MS);
-
-		if (s_lastAxisForwardResult == 0)
-		{
-			/* ★ 9 号后退之前必须先把 11 号的手臂收回来：钩子还插在箱子上时
-			   让 9 号退，会把箱子一起拖回去，或者直接钩住。
-			   所以这里串行等 11 号到位，到位了才启动 9 号；收不回来就不退，
-			   留在原地等上层处理，不带箱子跑。 */
-			(void)Motor_SetTargetPositionMain(4, 10000, MOTOR_POS_ABSOLUTE);
-
-			if (Motor_WaitArrive(4, 5000) == 0)
-			{
-				/* 最后 9 号单独回绝对 0，7/8 号不动 */
-				(void)Motor_SetTargetPositionMain(2, 0, MOTOR_POS_ABSOLUTE);
-				s_lastAxisZeroResult = (int8_t)Motor_WaitArrive(2, MOTOR_RETURN_TIMEOUT_MS);
-			}
-		}
-	}
-
-	for (;;)
-	{
-		osDelay(MOTOR_CTRL_IDLE_MS);
-	}
-}
 
 /**
   * @brief  创建电机任务。必须在 CAN_RxTaskCreate() 之后创建，
